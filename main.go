@@ -2,8 +2,8 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"net/http"
@@ -12,37 +12,32 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gin-gonic/gin"
 	"github.com/xuri/excelize/v2"
 )
 
-// ── Config ────────────────────────────────────────────────────────────────────
-// SECRET_KEY diambil dari environment variable — lebih aman dari hardcode
-func getSecretKey() string {
-	key := os.Getenv("SECRET_KEY")
-	if key == "" {
-		key = "pebisnice_default_key_ganti_ini" // fallback dev only
+// ── Config ────────────────────────────────────────────────────
+func secretKey() string {
+	k := os.Getenv("SECRET_KEY")
+	if k == "" {
+		k = "pebisnice_dev_key"
 	}
-	return key
+	return k
 }
 
-// ── Field Aliases ─────────────────────────────────────────────────────────────
-// Setiap field punya beberapa kemungkinan nama kolom di export Shopee
+// ── Field Aliases ─────────────────────────────────────────────
 var orderFieldAliases = map[string][]string{
-	"noPesanan":    {"No. Pesanan", "Order ID", "No Pesanan", "Nomor Pesanan"},
-	"waktuDibuat":  {"Waktu Pesanan Dibuat", "Tanggal Pesanan Dibuat", "Order Date", "Waktu Pembuatan Pesanan"},
+	"noPesanan":    {"No. Pesanan", "Order ID", "No Pesanan"},
+	"waktuDibuat":  {"Waktu Pesanan Dibuat", "Tanggal Pesanan Dibuat", "Order Date"},
 	"waktuSelesai": {"Waktu Pesanan Selesai", "Tanggal Pesanan Selesai", "Order Completion Time"},
 	"status":       {"Status Pesanan", "Order Status", "Status"},
-	"skuInduk":     {"SKU Induk", "Parent SKU", "SKU Utama", "Master SKU"},
-	"namaProduk":   {"Nama Produk", "Product Name", "Nama Barang", "Deskripsi Produk"},
-	"skuRef":       {"Nomor Referensi SKU", "SKU Reference Number", "Referensi SKU", "No. SKU", "Seller SKU"},
-	"variasi":      {"Nama Variasi", "Variation Name", "Variasi", "Nama Varian"},
-	"qty":          {"Jumlah", "Quantity", "Qty", "Jumlah Produk di Pesan", "Jumlah Produk"},
-	"totalHarga":   {"Total Harga Produk", "Subtotal Produk", "Total Product Price", "Total Harga"},
+	"skuInduk":     {"SKU Induk", "Parent SKU", "SKU Utama"},
+	"namaProduk":   {"Nama Produk", "Product Name", "Nama Barang"},
+	"skuRef":       {"Nomor Referensi SKU", "SKU Reference Number", "Seller SKU"},
+	"variasi":      {"Nama Variasi", "Variation Name", "Variasi"},
+	"qty":          {"Jumlah", "Quantity", "Qty", "Jumlah Produk di Pesan"},
+	"totalHarga":   {"Total Harga Produk", "Subtotal Produk", "Total Product Price"},
 	"totalBayar":   {"Total Pembayaran", "Total Payment", "Grand Total", "Buyer Paid"},
 }
-
-var criticalOrderFields = []string{"noPesanan", "namaProduk", "qty", "totalHarga", "totalBayar"}
 
 var incomeLabelAliases = map[string][]string{
 	"totalPendapatan":  {"1. Total Pendapatan"},
@@ -52,12 +47,14 @@ var incomeLabelAliases = map[string][]string{
 	"totalPengeluaran": {"2. Total Pengeluaran"},
 	"biayaKomisi":      {"Biaya Komisi AMS"},
 	"biayaAdmin":       {"Biaya Administrasi"},
-	"biayaLayanan":     {"Biaya Layanan", "Biaya Layanan (termasuk PPN 11%)", "Biaya Layanan (incl. PPN 11%)"},
+	"biayaLayanan":     {"Biaya Layanan", "Biaya Layanan (termasuk PPN 11%)"},
 	"biayaProses":      {"Biaya Proses Pesanan", "Biaya Proses"},
 	"totalDilepas":     {"3. Total yang Dilepas"},
 }
 
-// ── Data Types ────────────────────────────────────────────────────────────────
+var criticalFields = []string{"noPesanan", "namaProduk", "qty", "totalHarga", "totalBayar"}
+
+// ── Types ─────────────────────────────────────────────────────
 type OrderItem struct {
 	NoPesanan    string  `json:"noPesanan"`
 	WaktuDibuat  string  `json:"waktuDibuat"`
@@ -93,64 +90,55 @@ type RequestBody struct {
 	FileName   string `json:"fileName"`
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-// strip: bersihkan apostrophe awal dan whitespace (Shopee kadang prefix dengan ')
+// ── Helpers ───────────────────────────────────────────────────
 func strip(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.TrimLeft(s, "'")
 	return strings.TrimSpace(s)
 }
 
-// toNum: parse angka dari string, handles apostrophe prefix
 func toNum(s string) (float64, bool) {
-	s = strip(s)
-	s = strings.ReplaceAll(s, ",", "")
+	s = strings.ReplaceAll(strip(s), ",", "")
 	n, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0, false
-	}
-	return n, true
+	return n, err == nil
 }
 
-// cellStr: ambil nilai sel sebagai string bersih
-func cellStr(f *excelize.File, sheet, cell string) string {
-	v, _ := f.GetCellValue(sheet, cell)
-	return strip(v)
+func ptr(v float64) *float64 { return &v }
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
 }
 
-// decodeBase64ToFile: tulis base64 ke temp file, return path
-func decodeBase64ToFile(data string) (string, error) {
-	raw, err := base64.StdEncoding.DecodeString(data)
+func decodeToTempFile(b64 string) (string, error) {
+	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
 		return "", fmt.Errorf("base64 decode gagal: %w", err)
 	}
-	tmp, err := os.CreateTemp("", "pebisnice-*.xlsx")
+	f, err := os.CreateTemp("", "pb-*.xlsx")
 	if err != nil {
-		return "", fmt.Errorf("tidak bisa buat temp file: %w", err)
+		return "", err
 	}
-	defer tmp.Close()
-	if _, err := tmp.Write(raw); err != nil {
-		return "", fmt.Errorf("tidak bisa tulis temp file: %w", err)
-	}
-	return tmp.Name(), nil
+	defer f.Close()
+	_, err = f.Write(raw)
+	return f.Name(), err
 }
 
-// openXlsx: decode base64 dan buka sebagai excelize
-func openXlsx(base64Data string) (*excelize.File, string, error) {
-	path, err := decodeBase64ToFile(base64Data)
+func openXlsx(b64 string) (*excelize.File, string, error) {
+	path, err := decodeToTempFile(b64)
 	if err != nil {
 		return nil, "", err
 	}
 	f, err := excelize.OpenFile(path)
 	if err != nil {
 		os.Remove(path)
-		return nil, "", fmt.Errorf("tidak bisa buka file xlsx: %w", err)
+		return nil, "", fmt.Errorf("tidak bisa buka xlsx: %w", err)
 	}
 	return f, path, nil
 }
 
-// getAllRows: ambil semua baris dari sheet pertama
 func getAllRows(f *excelize.File) ([][]string, error) {
 	sheets := f.GetSheetList()
 	if len(sheets) == 0 {
@@ -158,31 +146,28 @@ func getAllRows(f *excelize.File) ([][]string, error) {
 	}
 	rows, err := f.GetRows(sheets[0])
 	if err != nil {
-		return nil, fmt.Errorf("tidak bisa baca rows: %w", err)
+		return nil, err
 	}
-	// Strip apostrophe dari semua sel
 	for i, row := range rows {
-		for j, cell := range row {
-			rows[i][j] = strip(cell)
+		for j, c := range row {
+			rows[i][j] = strip(c)
 		}
 	}
 	return rows, nil
 }
 
-// findHeaderRow: cari baris header dengan mencocokkan nama field primer
 func findHeaderRow(rows [][]string) (int, error) {
-	primaryNames := make(map[string]bool)
+	primary := map[string]bool{}
 	for _, aliases := range orderFieldAliases {
-		primaryNames[aliases[0]] = true
+		primary[aliases[0]] = true
 	}
-
 	for i, row := range rows {
 		if i >= 10 {
 			break
 		}
 		hits := 0
-		for _, cell := range row {
-			if primaryNames[cell] {
+		for _, c := range row {
+			if primary[c] {
 				hits++
 			}
 		}
@@ -190,63 +175,59 @@ func findHeaderRow(rows [][]string) (int, error) {
 			return i, nil
 		}
 	}
-	return -1, fmt.Errorf("baris header tidak ditemukan. Pastikan file adalah export Order Shopee")
+	return -1, fmt.Errorf("header tidak ditemukan — pastikan file adalah export Order Shopee")
 }
 
-// buildColIndex: buat map fieldKey → index kolom menggunakan alias matching
-func buildColIndex(headers []string) map[string]int {
-	colIdx := make(map[string]int)
+func buildColIdx(headers []string) map[string]int {
+	idx := map[string]int{}
 	for field, aliases := range orderFieldAliases {
-		colIdx[field] = -1
+		idx[field] = -1
 		for _, alias := range aliases {
 			for i, h := range headers {
 				if h == alias {
-					colIdx[field] = i
-					goto nextField
+					idx[field] = i
+					goto next
 				}
 			}
 		}
-	nextField:
+	next:
 	}
-	return colIdx
+	return idx
 }
 
-// getCell: ambil nilai dari row berdasarkan field key
-func getCell(row []string, colIdx map[string]int, field string) string {
-	idx, ok := colIdx[field]
-	if !ok || idx < 0 || idx >= len(row) {
+func getCell(row []string, idx map[string]int, field string) string {
+	i, ok := idx[field]
+	if !ok || i < 0 || i >= len(row) {
 		return ""
 	}
-	return strip(row[idx])
+	return row[i]
 }
 
-// detectRibuan: deteksi apakah nilai dalam ribuan Rupiah (×1000)
-// Shopee export harga dalam ribuan: 35 = Rp 35.000
-func detectRibuan(rows [][]string, headerIdx int, totalHargaCol int) bool {
-	if totalHargaCol < 0 {
-		return true // default assume ribuan
+func detectRibuan(rows [][]string, headerIdx, col int) bool {
+	if col < 0 {
+		return true
 	}
 	var samples []float64
-	for i := headerIdx + 1; i < len(rows) && len(samples) < 20; i++ {
-		if totalHargaCol >= len(rows[i]) {
-			continue
+	for _, row := range rows[headerIdx+1:] {
+		if len(samples) >= 20 {
+			break
 		}
-		n, ok := toNum(rows[i][totalHargaCol])
-		if ok && n > 0 {
-			samples = append(samples, n)
+		if col < len(row) {
+			if n, ok := toNum(row[col]); ok && n > 0 {
+				samples = append(samples, n)
+			}
 		}
 	}
 	if len(samples) == 0 {
 		return true
 	}
 	sort.Float64s(samples)
-	median := samples[len(samples)/2]
-	return median < 1000 // jika median < 1000 → kemungkinan besar ribuan
+	return samples[len(samples)/2] < 1000
 }
 
-// ── Parse Order ───────────────────────────────────────────────────────────────
-func parseOrder(base64Data string) ([]OrderItem, int, string, error) {
-	f, path, err := openXlsx(base64Data)
+// ── Parse Order ───────────────────────────────────────────────
+func parseOrder(b64 string) ([]OrderItem, int, string, error) {
+	f, path, err := openXlsx(b64)
 	if err != nil {
 		return nil, 0, "", err
 	}
@@ -258,66 +239,57 @@ func parseOrder(base64Data string) ([]OrderItem, int, string, error) {
 		return nil, 0, "", err
 	}
 
-	headerIdx, err := findHeaderRow(rows)
+	hIdx, err := findHeaderRow(rows)
 	if err != nil {
 		return nil, 0, "", err
 	}
 
-	headers := rows[headerIdx]
-	colIdx := buildColIndex(headers)
+	headers := rows[hIdx]
+	colIdx := buildColIdx(headers)
 
-	// Validasi critical columns
-	var missingCols []string
-	for _, field := range criticalOrderFields {
-		if idx, ok := colIdx[field]; !ok || idx < 0 {
-			missingCols = append(missingCols, field)
+	// Validate critical
+	var missing []string
+	for _, field := range criticalFields {
+		if i, ok := colIdx[field]; !ok || i < 0 {
+			missing = append(missing, field)
 		}
 	}
-	if len(missingCols) > 0 {
-		return nil, 0, "", fmt.Errorf("kolom penting tidak ditemukan: %s", strings.Join(missingCols, ", "))
+	if len(missing) > 0 {
+		return nil, 0, "", fmt.Errorf("kolom tidak ditemukan: %s", strings.Join(missing, ", "))
 	}
 
-	multiplyK := detectRibuan(rows, headerIdx, colIdx["totalHarga"])
-	multiplier := 1.0
-	if multiplyK {
-		multiplier = 1000.0
+	mult := 1.0
+	if detectRibuan(rows, hIdx, colIdx["totalHarga"]) {
+		mult = 1000.0
 	}
 
-	statusCompleted := map[string]bool{
-		"Selesai": true, "Completed": true, "Complete": true,
-		"SELESAI": true, "selesai": true,
-	}
-
+	completed := map[string]bool{"Selesai": true, "Completed": true, "SELESAI": true}
 	var orders []OrderItem
 	nonSelesai := 0
+	uniqueMap := map[string]bool{}
 
-	for _, row := range rows[headerIdx+1:] {
+	for _, row := range rows[hIdx+1:] {
 		noPesanan := getCell(row, colIdx, "noPesanan")
 		if noPesanan == "" {
 			continue
 		}
+		uniqueMap[noPesanan] = true
 
 		status := getCell(row, colIdx, "status")
-		if status != "" && !statusCompleted[status] {
+		if status != "" && !completed[status] {
 			nonSelesai++
 		}
 
 		qty, _ := toNum(getCell(row, colIdx, "qty"))
 		totalHarga, _ := toNum(getCell(row, colIdx, "totalHarga"))
 		totalBayar, _ := toNum(getCell(row, colIdx, "totalBayar"))
-
 		skuRef   := getCell(row, colIdx, "skuRef")
 		skuInduk := getCell(row, colIdx, "skuInduk")
 		namaProd := getCell(row, colIdx, "namaProduk")
 
-		// Fallback chain untuk HPP lookup
 		skuForHpp := skuRef
-		if skuForHpp == "" {
-			skuForHpp = skuInduk
-		}
-		if skuForHpp == "" {
-			skuForHpp = namaProd
-		}
+		if skuForHpp == "" { skuForHpp = skuInduk }
+		if skuForHpp == "" { skuForHpp = namaProd }
 
 		orders = append(orders, OrderItem{
 			NoPesanan:    noPesanan,
@@ -330,32 +302,25 @@ func parseOrder(base64Data string) ([]OrderItem, int, string, error) {
 			SkuForHpp:    skuForHpp,
 			Variasi:      getCell(row, colIdx, "variasi"),
 			Qty:          qty,
-			TotalHarga:   math.Round(totalHarga*multiplier*100) / 100,
-			TotalBayar:   math.Round(totalBayar*multiplier*100) / 100,
+			TotalHarga:   math.Round(totalHarga*mult*100) / 100,
+			TotalBayar:   math.Round(totalBayar*mult*100) / 100,
 		})
 	}
 
 	if len(orders) == 0 {
-		return nil, 0, "", fmt.Errorf("tidak ada data order ditemukan")
+		return nil, 0, "", fmt.Errorf("tidak ada data order")
 	}
 
-	// Hitung unique orders
-	uniqueMap := make(map[string]bool)
-	for _, o := range orders {
-		uniqueMap[o.NoPesanan] = true
-	}
-
-	warning := ""
+	warn := ""
 	if nonSelesai > 0 {
-		warning = fmt.Sprintf("%d order dengan status bukan Selesai ikut terimport.", nonSelesai)
+		warn = fmt.Sprintf("%d order bukan Selesai ikut terimport", nonSelesai)
 	}
-
-	return orders, len(uniqueMap), warning, nil
+	return orders, len(uniqueMap), warn, nil
 }
 
-// ── Parse Income ──────────────────────────────────────────────────────────────
-func parseIncome(base64Data string) (*IncomeData, string, string, string, error) {
-	f, path, err := openXlsx(base64Data)
+// ── Parse Income ──────────────────────────────────────────────
+func parseIncome(b64 string) (*IncomeData, string, string, string, error) {
+	f, path, err := openXlsx(b64)
 	if err != nil {
 		return nil, "", "", "", err
 	}
@@ -367,55 +332,47 @@ func parseIncome(base64Data string) (*IncomeData, string, string, string, error)
 		return nil, "", "", "", err
 	}
 
-	// Build label map: setiap label di row → rightmost numeric value di row yang sama
-	// Ini handle format 4-kolom (2025) dan 2-kolom (2026) sekaligus
-	labelNumMap := make(map[string]float64)
-	labelStrMap := make(map[string]string)
+	// Rightmost numeric value per row → label map
+	numMap := map[string]float64{}
+	strMap := map[string]string{}
 
 	for _, row := range rows {
-		// Cari nilai numerik paling kanan di row ini
-		rightmostNum := math.NaN()
+		rightNum := math.NaN()
 		for ci := len(row) - 1; ci >= 0; ci-- {
 			if n, ok := toNum(row[ci]); ok {
-				rightmostNum = n
+				rightNum = n
 				break
 			}
 		}
-
-		// Map setiap label text di row ini ke nilai numerik tersebut
 		for ci, cell := range row {
 			label := strip(cell)
-			if label == "" || len(label) < 2 {
+			if len(label) < 2 {
 				continue
 			}
-			if !math.IsNaN(rightmostNum) {
-				labelNumMap[label] = rightmostNum
+			if !math.IsNaN(rightNum) {
+				numMap[label] = rightNum
 			}
-			// Juga map ke nilai string berikutnya (untuk Dari, ke, Username)
 			if ci+1 < len(row) {
-				nextVal := strip(row[ci+1])
-				if nextVal != "" {
-					if _, isNum := toNum(nextVal); !isNum {
-						labelStrMap[label] = nextVal
+				next := strip(row[ci+1])
+				if next != "" {
+					if _, isNum := toNum(next); !isNum {
+						strMap[label] = next
 					}
 				}
 			}
 		}
 	}
 
-	// Lookup dengan alias
-	lookupNum := func(primaryLabel string) *float64 {
-		aliases := incomeLabelAliases[primaryLabel]
-		for _, alias := range aliases {
-			if v, ok := labelNumMap[alias]; ok {
-				result := v
-				return &result
+	lookupNum := func(primary string) *float64 {
+		for _, alias := range incomeLabelAliases[primary] {
+			if v, ok := numMap[alias]; ok {
+				return ptr(v)
 			}
 		}
 		return nil
 	}
 
-	income := &IncomeData{
+	inc := &IncomeData{
 		TotalPendapatan:  lookupNum("totalPendapatan"),
 		HargaAsli:        lookupNum("hargaAsli"),
 		TotalDiskon:      lookupNum("totalDiskon"),
@@ -428,134 +385,111 @@ func parseIncome(base64Data string) (*IncomeData, string, string, string, error)
 		TotalDilepas:     lookupNum("totalDilepas"),
 	}
 
-	if income.TotalDilepas == nil && income.TotalPendapatan == nil {
+	if inc.TotalDilepas == nil && inc.TotalPendapatan == nil {
 		return nil, "", "", "", fmt.Errorf(
-			"data penghasilan tidak ditemukan. Pastikan file adalah Laporan Penghasilan Shopee")
+			"data penghasilan tidak ditemukan — pastikan file adalah Laporan Penghasilan Shopee")
 	}
 
-	dari     := labelStrMap["Dari"]
-	ke       := labelStrMap["ke"]
-	username := labelStrMap["Username (Penjual)"]
-
-	return income, dari, ke, username, nil
+	return inc,
+		strMap["Dari"],
+		strMap["ke"],
+		strMap["Username (Penjual)"],
+		nil
 }
 
-// ── Middleware ────────────────────────────────────────────────────────────────
-func authMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var body RequestBody
-		// Peek at body to get key
-		if err := c.ShouldBindJSON(&body); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "invalid request body"})
-			c.Abort()
+// ── Handlers ──────────────────────────────────────────────────
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		if body.Key != getSecretKey() {
-			c.JSON(http.StatusUnauthorized, gin.H{"success": false, "error": "Unauthorized"})
-			c.Abort()
-			return
-		}
-		// Store parsed body so handler can use it
-		c.Set("body", body)
-		c.Next()
+		next(w, r)
 	}
 }
 
-// ── Handlers ──────────────────────────────────────────────────────────────────
-func handleParse(c *gin.Context) {
-	body, _ := c.Get("body")
-	req := body.(RequestBody)
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]string{"status": "ok", "service": "pebisnice-backend"})
+}
+
+func handleParse(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"success": false, "error": "method not allowed"})
+		return
+	}
+
+	var req RequestBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]any{"success": false, "error": "invalid JSON"})
+		return
+	}
+
+	if req.Key != secretKey() {
+		writeJSON(w, 401, map[string]any{"success": false, "error": "Unauthorized"})
+		return
+	}
 
 	if req.FileBase64 == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "fileBase64 is required"})
+		writeJSON(w, 400, map[string]any{"success": false, "error": "fileBase64 is required"})
 		return
 	}
 
 	switch req.Type {
 	case "order":
-		orders, uniqueOrders, warning, err := parseOrder(req.FileBase64)
+		orders, uniqueOrders, warn, err := parseOrder(req.FileBase64)
 		if err != nil {
 			log.Printf("[ERROR] parseOrder: %v", err)
-			c.JSON(http.StatusOK, gin.H{"success": false, "error": err.Error()})
+			writeJSON(w, 200, map[string]any{"success": false, "error": err.Error()})
 			return
 		}
-		resp := gin.H{
+		resp := map[string]any{
 			"success":      true,
 			"orders":       orders,
 			"totalRows":    len(orders),
 			"uniqueOrders": uniqueOrders,
 		}
-		if warning != "" {
-			resp["warning"] = warning
+		if warn != "" {
+			resp["warning"] = warn
 		}
-		c.JSON(http.StatusOK, resp)
+		writeJSON(w, 200, resp)
 
 	case "income":
-		income, dari, ke, username, err := parseIncome(req.FileBase64)
+		inc, dari, ke, username, err := parseIncome(req.FileBase64)
 		if err != nil {
 			log.Printf("[ERROR] parseIncome: %v", err)
-			c.JSON(http.StatusOK, gin.H{"success": false, "error": err.Error()})
+			writeJSON(w, 200, map[string]any{"success": false, "error": err.Error()})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{
+		writeJSON(w, 200, map[string]any{
 			"success":  true,
-			"income":   income,
+			"income":   inc,
 			"dari":     dari,
 			"ke":       ke,
 			"username": username,
 		})
 
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "type harus 'order' atau 'income'"})
+		writeJSON(w, 400, map[string]any{"success": false, "error": "type harus 'order' atau 'income'"})
 	}
 }
 
-func handleHealth(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "pebisnice-backend"})
-}
-
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ── Main ──────────────────────────────────────────────────────
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	// Production mode jika PORT di-set (Leapcell selalu set PORT)
-	if os.Getenv("PORT") != "" {
-		gin.SetMode(gin.ReleaseMode)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", corsMiddleware(handleHealth))
+	mux.HandleFunc("/parse",  corsMiddleware(handleParse))
+	mux.HandleFunc("/",       corsMiddleware(handleHealth))
+
+	log.Printf("🚀 Pebisnice Backend — port %s", port)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
+		log.Fatalf("Server gagal: %v", err)
 	}
-
-	r := gin.Default()
-
-	// CORS — izinkan request dari Google Apps Script
-	r.Use(func(c *gin.Context) {
-		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(http.StatusNoContent)
-			return
-		}
-		c.Next()
-	})
-
-	r.GET("/health", handleHealth)
-	r.POST("/parse", authMiddleware(), handleParse)
-
-	// Redirect root ke health untuk mudah cek status
-	r.GET("/", func(c *gin.Context) {
-		c.Redirect(http.StatusTemporaryRedirect, "/health")
-	})
-
-	log.Printf("🚀 Pebisnice Backend running on port %s", port)
-	if err := r.Run(":" + port); err != nil {
-		log.Fatalf("Server gagal start: %v", err)
-	}
-}
-
-// ── File reader helper untuk excelize ─────────────────────────────────────────
-// excelize butuh io.ReadSeeker, helper ini convert file path
-func openFileAsReader(path string) (io.ReadSeekCloser, error) {
-	return os.Open(path)
 }
