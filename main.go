@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	_ "github.com/lib/pq"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -38,12 +40,10 @@ func lynkWebhookToken() string {
 	return os.Getenv("LYNK_WEBHOOK_TOKEN")
 }
 
-// File JSON untuk persist authorized emails (survive Leapcell restart)
-const authorizedEmailsFile = "/tmp/pb_authorized_emails.json"
-
 // ════════════════════════════════════════════════════════════════
 // AUTHORIZED EMAILS STORE
-// In-memory + file persistence
+// Primary: Supabase PostgreSQL (permanen, survive restart)
+// Cache:   in-memory map (load saat startup, update saat webhook)
 // ════════════════════════════════════════════════════════════════
 
 type PurchaseRecord struct {
@@ -51,83 +51,153 @@ type PurchaseRecord struct {
 	RefID       string    `json:"refId"`
 	ProductName string    `json:"productName"`
 	PurchasedAt time.Time `json:"purchasedAt"`
-	ExpiresAt   time.Time `json:"expiresAt"`
 }
 
 var (
-	emailStoreMu    sync.RWMutex
-	authorizedEmails = map[string]*PurchaseRecord{} // key: email lowercase
+	db           *sql.DB
+	emailStoreMu sync.RWMutex
+	emailCache   = map[string]*PurchaseRecord{} // in-memory cache
 )
 
-// Load dari file saat startup (restore setelah restart)
-func loadAuthorizedEmails() {
-	data, err := os.ReadFile(authorizedEmailsFile)
-	if err != nil {
-		return // file belum ada, normal
+// DATABASE_URL format: postgres://user:password@host:5432/dbname?sslmode=require
+func dbURL() string {
+	return os.Getenv("DATABASE_URL")
+}
+
+// Inisialisasi koneksi Supabase PostgreSQL
+func initDB() error {
+	dsn := dbURL()
+	if dsn == "" {
+		log.Println("[DB] DATABASE_URL tidak diset — mode tanpa database")
+		return nil
 	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		return fmt.Errorf("gagal buka koneksi DB: %w", err)
+	}
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	// Buat tabel jika belum ada
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS purchases (
+			id          SERIAL PRIMARY KEY,
+			email       TEXT NOT NULL UNIQUE,
+			ref_id      TEXT,
+			product     TEXT,
+			bought_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+		CREATE INDEX IF NOT EXISTS purchases_email_idx ON purchases(email);
+	`)
+	if err != nil {
+		return fmt.Errorf("gagal buat tabel: %w", err)
+	}
+	log.Println("[DB] Terkoneksi ke Supabase PostgreSQL")
+	return nil
+}
+
+// Load semua email dari DB ke in-memory cache (dipanggil sekali saat startup)
+func loadEmailsFromDB() {
+	if db == nil {
+		return
+	}
+	rows, err := db.Query(`SELECT email, ref_id, product, bought_at FROM purchases`)
+	if err != nil {
+		log.Printf("[DB] Gagal load emails: %v", err)
+		return
+	}
+	defer rows.Close()
+
 	emailStoreMu.Lock()
 	defer emailStoreMu.Unlock()
-	var records []*PurchaseRecord
-	if err := json.Unmarshal(data, &records); err != nil {
-		log.Printf("[STORE] Gagal load authorized emails: %v", err)
-		return
-	}
-	now := time.Now()
 	loaded := 0
-	for _, r := range records {
-		if r.ExpiresAt.After(now) {
-			authorizedEmails[r.Email] = r
-			loaded++
+	for rows.Next() {
+		var r PurchaseRecord
+		if err := rows.Scan(&r.Email, &r.RefID, &r.ProductName, &r.PurchasedAt); err != nil {
+			continue
 		}
+		emailCache[r.Email] = &r
+		loaded++
 	}
-	log.Printf("[STORE] Loaded %d authorized emails from disk", loaded)
+	log.Printf("[DB] Loaded %d emails dari Supabase ke cache", loaded)
 }
 
-// Simpan ke file (dipanggil setiap kali ada perubahan)
-func persistAuthorizedEmails() {
-	emailStoreMu.RLock()
-	records := make([]*PurchaseRecord, 0, len(authorizedEmails))
-	for _, r := range authorizedEmails {
-		records = append(records, r)
-	}
-	emailStoreMu.RUnlock()
-
-	data, err := json.Marshal(records)
-	if err != nil {
-		log.Printf("[STORE] Gagal marshal emails: %v", err)
-		return
-	}
-	if err := os.WriteFile(authorizedEmailsFile, data, 0600); err != nil {
-		log.Printf("[STORE] Gagal write file: %v", err)
-	}
-}
-
-// Tambah email baru dari webhook
+// Tambah/update email dari webhook → simpan ke DB + update cache
 func authorizeEmail(email, refID, productName string) {
 	email = strings.ToLower(strings.TrimSpace(email))
-	emailStoreMu.Lock()
-	authorizedEmails[email] = &PurchaseRecord{
+	record := &PurchaseRecord{
 		Email:       email,
 		RefID:       refID,
 		ProductName: productName,
 		PurchasedAt: time.Now(),
-		ExpiresAt:   time.Now().Add(90 * 24 * time.Hour), // 90 hari
 	}
+
+	// Update in-memory cache dulu (non-blocking)
+	emailStoreMu.Lock()
+	emailCache[email] = record
 	emailStoreMu.Unlock()
+
+	// Simpan ke Supabase (async — tidak blocking webhook response)
+	go func() {
+		if db == nil {
+			return
+		}
+		_, err := db.Exec(`
+			INSERT INTO purchases (email, ref_id, product, bought_at, updated_at)
+			VALUES ($1, $2, $3, NOW(), NOW())
+			ON CONFLICT (email) DO UPDATE SET
+				ref_id     = EXCLUDED.ref_id,
+				product    = EXCLUDED.product,
+				updated_at = NOW()
+		`, email, refID, productName)
+		if err != nil {
+			log.Printf("[DB] Gagal upsert email %s: %v", email, err)
+		} else {
+			log.Printf("[DB] Tersimpan: email=%s refId=%s", email, refID)
+		}
+	}()
+
 	log.Printf("[AUTHORIZE] email=%s refId=%s", email, refID)
-	go persistAuthorizedEmails()
 }
 
-// Cek apakah email sudah beli
+// Cek apakah email sudah beli (dari cache — cepat, tanpa query DB)
+// Jika tidak ada di cache, cek langsung ke DB (fallback untuk cache miss)
 func isEmailAuthorized(email string) *PurchaseRecord {
 	email = strings.ToLower(strings.TrimSpace(email))
+
+	// Cek cache dulu
 	emailStoreMu.RLock()
-	defer emailStoreMu.RUnlock()
-	r, ok := authorizedEmails[email]
-	if !ok || r.ExpiresAt.Before(time.Now()) {
+	r, ok := emailCache[email]
+	emailStoreMu.RUnlock()
+	if ok {
+		return r
+	}
+
+	// Cache miss → query langsung ke DB (buyer yang beli sebelum server restart)
+	if db == nil {
 		return nil
 	}
-	return r
+	var record PurchaseRecord
+	err := db.QueryRow(`
+		SELECT email, ref_id, product, bought_at
+		FROM purchases WHERE email = $1
+	`, email).Scan(&record.Email, &record.RefID, &record.ProductName, &record.PurchasedAt)
+	if err != nil {
+		if err != sql.ErrNoRows {
+			log.Printf("[DB] Query error untuk %s: %v", email, err)
+		}
+		return nil
+	}
+
+	// Masukkan ke cache untuk request berikutnya
+	emailStoreMu.Lock()
+	emailCache[email] = &record
+	emailStoreMu.Unlock()
+
+	return &record
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -608,12 +678,21 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	emailStoreMu.RLock()
-	count := len(authorizedEmails)
+	count := len(emailCache)
 	emailStoreMu.RUnlock()
+	dbStatus := "no database"
+	if db != nil {
+		if err := db.Ping(); err == nil {
+			dbStatus = "connected"
+		} else {
+			dbStatus = "error: " + err.Error()
+		}
+	}
 	writeJSON(w, 200, map[string]any{
-		"status":           "ok",
-		"service":          "pebisnice-backend",
-		"authorizedEmails": count,
+		"status":       "ok",
+		"service":      "pebisnice-backend",
+		"cachedEmails": count,
+		"database":     dbStatus,
 	})
 }
 
@@ -890,7 +969,12 @@ func main() {
 	}
 
 	// Restore authorized emails dari disk (survive restart)
-	loadAuthorizedEmails()
+	// Init Supabase PostgreSQL
+	if err := initDB(); err != nil {
+		log.Printf("[DB] Warning: %v — berjalan tanpa database", err)
+	} else {
+		loadEmailsFromDB()
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health",   corsMiddleware(handleHealth))
