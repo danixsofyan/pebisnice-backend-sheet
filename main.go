@@ -308,8 +308,8 @@ var orderFieldAliases = map[string][]string{
 	"skuRef":       {"Nomor Referensi SKU", "SKU Reference Number", "Seller SKU"},
 	"variasi":      {"Nama Variasi", "Variation Name", "Variasi"},
 	"qty":          {"Jumlah", "Quantity", "Qty", "Jumlah Produk di Pesan"},
-	"totalHarga":   {"Total Harga Produk", "Subtotal Produk", "Total Product Price"},
-	"totalBayar":   {"Total Pembayaran", "Total Payment", "Grand Total", "Buyer Paid"},
+	"totalHarga":   {"Total Harga Produk", "Harga Setelah Diskon", "Subtotal Produk", "Total Product Price"},
+	"totalBayar":   {"Total Pembayaran", "Dibayar Pembeli", "Total Payment", "Grand Total", "Buyer Paid"},
 }
 
 var incomeLabelAliases = map[string][]string{
