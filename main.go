@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -232,6 +233,7 @@ type LynkWebhookPayload struct {
 	Event string `json:"event"`
 	Data  struct {
 		MessageAction string `json:"message_action"`
+		MessageID     string `json:"message_id"`
 		MessageData   struct {
 			RefID    string `json:"refId"`
 			Customer struct {
@@ -243,6 +245,9 @@ type LynkWebhookPayload struct {
 				Price int    `json:"price"`
 				Qty   int    `json:"qty"`
 			} `json:"items"`
+			Totals struct {
+				GrandTotal int `json:"grandTotal"`
+			} `json:"totals"`
 		} `json:"message_data"`
 	} `json:"data"`
 }
@@ -626,22 +631,44 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verifikasi Lynk.id signature
-	// Header: X-Lynk-Signature: <token yang kamu set di Lynk.id dashboard>
-	expectedToken := lynkWebhookToken()
-	if expectedToken != "" {
-		signature := r.Header.Get("X-Lynk-Signature")
-		if signature != expectedToken {
-			log.Printf("[WEBHOOK] Invalid signature: %q", signature)
+	// Baca body sekaligus — butuh untuk signature + parsing
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"success": false, "error": "gagal baca body"})
+		return
+	}
+
+	// Parse payload
+	var payload LynkWebhookPayload
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		writeJSON(w, 400, map[string]any{"success": false, "error": "invalid JSON"})
+		return
+	}
+
+	// ── Validasi Signature Lynk.id ────────────────────────────
+	// Formula: SHA256(grandTotal + refId + message_id + merchantKey)
+	// Dikirim via header: X-Lynk-Signature
+	merchantKey := lynkWebhookToken()
+	if merchantKey != "" {
+		receivedSig := r.Header.Get("X-Lynk-Signature")
+		refID       := payload.Data.MessageData.RefID
+		messageID   := payload.Data.MessageID
+		amount      := strconv.Itoa(payload.Data.MessageData.Totals.GrandTotal)
+
+		sigInput := amount + refID + messageID + merchantKey
+		h        := sha256.New()
+		h.Write([]byte(sigInput))
+		expectedSig := hex.EncodeToString(h.Sum(nil))
+
+		log.Printf("[WEBHOOK] sig_input=%q", sigInput)
+		log.Printf("[WEBHOOK] expected=%s received=%s", expectedSig, receivedSig)
+
+		if receivedSig != expectedSig {
+			log.Printf("[WEBHOOK] ❌ Signature mismatch")
 			writeJSON(w, 401, map[string]any{"success": false, "error": "invalid signature"})
 			return
 		}
-	}
-
-	var payload LynkWebhookPayload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		writeJSON(w, 400, map[string]any{"success": false, "error": "invalid JSON"})
-		return
+		log.Printf("[WEBHOOK] ✅ Signature valid")
 	}
 
 	// Hanya proses event payment.received dengan status SUCCESS
