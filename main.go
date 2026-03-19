@@ -648,12 +648,22 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	// ── Validasi Signature Lynk.id ────────────────────────────
 	// Formula: SHA256(grandTotal + refId + message_id + merchantKey)
 	// Dikirim via header: X-Lynk-Signature
+	// Catatan: Test URL dari Lynk.id dashboard tidak mengirim signature
+	//          (hanya ping koneksi) → jika header kosong, anggap test ping
 	merchantKey := lynkWebhookToken()
+	receivedSig := r.Header.Get("X-Lynk-Signature")
+
+	if receivedSig == "" {
+		// Test ping dari Lynk.id dashboard — tidak ada signature
+		log.Printf("[WEBHOOK] Test ping diterima (no signature) ✅")
+		writeJSON(w, 200, map[string]any{"success": true, "note": "test ping ok"})
+		return
+	}
+
 	if merchantKey != "" {
-		receivedSig := r.Header.Get("X-Lynk-Signature")
-		refID       := payload.Data.MessageData.RefID
-		messageID   := payload.Data.MessageID
-		amount      := strconv.Itoa(payload.Data.MessageData.Totals.GrandTotal)
+		refID     := payload.Data.MessageData.RefID
+		messageID := payload.Data.MessageID
+		amount    := strconv.Itoa(payload.Data.MessageData.Totals.GrandTotal)
 
 		sigInput := amount + refID + messageID + merchantKey
 		h        := sha256.New()
