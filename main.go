@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
@@ -91,6 +92,15 @@ func initDB() error {
 			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
 		CREATE INDEX IF NOT EXISTS purchases_email_idx ON purchases(email);
+
+		CREATE TABLE IF NOT EXISTS activations (
+			spreadsheet_id  TEXT PRIMARY KEY,
+			email           TEXT NOT NULL,
+			token           TEXT NOT NULL,
+			activated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+		CREATE INDEX IF NOT EXISTS activations_email_idx ON activations(email);
+		CREATE INDEX IF NOT EXISTS activations_token_idx ON activations(token);
 	`)
 	if err != nil {
 		return fmt.Errorf("gagal buat tabel: %w", err)
@@ -216,18 +226,55 @@ func isEmailAuthorized(email string) *PurchaseRecord {
 }
 
 // ════════════════════════════════════════════════════════════════
-// HMAC TOKEN — stateless per spreadsheetId
+// TOKEN MANAGEMENT — random UUID di Supabase
+//
+// Token = random hex 64 karakter, dibuat saat /activate
+// Disimpan di DB tabel activations(spreadsheet_id, email, token)
+// Tidak bisa di-forge — harus ada record di DB
+//
+// Anti-bypass: pirate tidak bisa hardcode spreadsheetId+email
+// karena token-nya random dan hanya ada di DB kita
 // ════════════════════════════════════════════════════════════════
 
 func generateToken(spreadsheetId string) string {
-	mac := hmac.New(sha256.New, []byte(secretKey()))
-	mac.Write([]byte(spreadsheetId))
-	return hex.EncodeToString(mac.Sum(nil))
+	// Random token — tidak deterministik, tidak bisa di-forge
+	b := make([]byte, 32)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
-func validateToken(spreadsheetId, token string) bool {
-	expected := generateToken(spreadsheetId)
-	return hmac.Equal([]byte(token), []byte(expected))
+// validateToken: cek token di DB activations
+// return (valid bool, email string)
+func validateToken(spreadsheetId, token string) (bool, string) {
+	if db == nil || spreadsheetId == "" || token == "" {
+		return false, ""
+	}
+	var email string
+	err := db.QueryRow(
+		`SELECT email FROM activations WHERE spreadsheet_id=$1 AND token=$2`,
+		spreadsheetId, token,
+	).Scan(&email)
+	if err != nil {
+		return false, ""
+	}
+	return true, email
+}
+
+// saveActivation: simpan token ke DB activations
+// Jika spreadsheetId sudah ada, update token (re-aktivasi)
+func saveActivation(spreadsheetId, email, token string) error {
+	if db == nil {
+		return fmt.Errorf("database tidak tersedia")
+	}
+	_, err := db.Exec(`
+		INSERT INTO activations (spreadsheet_id, email, token, activated_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (spreadsheet_id) DO UPDATE SET
+			token = EXCLUDED.token,
+			email = EXCLUDED.email,
+			activated_at = NOW()
+	`, spreadsheetId, email, token)
+	return err
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -866,8 +913,17 @@ func handleActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Email valid → generate token HMAC(spreadsheetId)
+	// Generate random token dan simpan ke DB
 	token := generateToken(req.SpreadsheetId)
+	if err := saveActivation(req.SpreadsheetId, email, token); err != nil {
+		log.Printf("[ACTIVATE] Gagal simpan token: %v", err)
+		writeJSON(w, 500, map[string]any{
+			"success": false,
+			"error":   "Gagal menyimpan aktivasi. Coba lagi.",
+		})
+		return
+	}
+
 	log.Printf("[ACTIVATE] ✅ email=%s spreadsheetId=%s", email, req.SpreadsheetId)
 
 	writeJSON(w, 200, map[string]any{
@@ -912,7 +968,8 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !validateToken(req.SpreadsheetId, req.Token) {
+	valid, tokenEmail := validateToken(req.SpreadsheetId, req.Token)
+	if !valid {
 		log.Printf("[PARSE] INVALID TOKEN — spreadsheetId=%s", req.SpreadsheetId)
 		writeJSON(w, 401, map[string]any{
 			"success": false,
@@ -920,6 +977,7 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	log.Printf("[PARSE] ✅ token valid — email=%s spreadsheetId=%s", tokenEmail, req.SpreadsheetId)
 
 	if isBlocked(req.SpreadsheetId) {
 		writeJSON(w, 403, map[string]any{
