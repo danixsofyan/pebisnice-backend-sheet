@@ -95,7 +95,12 @@ func initDB() error {
 	if err != nil {
 		return fmt.Errorf("gagal buat tabel: %w", err)
 	}
-	log.Println("[DB] Terkoneksi ke Supabase PostgreSQL")
+	// Verifikasi koneksi benar-benar aktif
+	if err := db.Ping(); err != nil {
+		db = nil
+		return fmt.Errorf("ping DB gagal: %w", err)
+	}
+	log.Println("[DB] Terkoneksi ke Supabase PostgreSQL ✅")
 	return nil
 }
 
@@ -140,10 +145,20 @@ func authorizeEmail(email, refID, productName string) {
 	emailCache[email] = record
 	emailStoreMu.Unlock()
 
-	// Simpan ke Supabase (async — tidak blocking webhook response)
+	// Simpan ke Supabase — sync agar error terlihat di log
 	go func() {
 		if db == nil {
-			return
+			log.Printf("[DB] ⚠️  db=nil saat upsert %s — DATABASE_URL mungkin belum terset saat startup", email)
+			// Coba init ulang DB jika belum terhubung
+			if err := initDB(); err != nil {
+				log.Printf("[DB] Retry initDB gagal: %v", err)
+				return
+			}
+			if db == nil {
+				log.Printf("[DB] Retry initDB selesai tapi db masih nil — skip upsert")
+				return
+			}
+			log.Printf("[DB] Retry initDB berhasil — lanjut upsert")
 		}
 		_, err := db.Exec(`
 			INSERT INTO purchases (email, ref_id, product, bought_at, updated_at)
@@ -959,6 +974,55 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 }
 
 // ════════════════════════════════════════════════════════════════
+// HANDLER: /admin/authorize
+// Tambah email manual — untuk test atau refund/re-issue
+// Dilindungi SECRET_KEY — tidak bisa diakses buyer
+// ════════════════════════════════════════════════════════════════
+
+func handleAdminAuthorize(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"success": false, "error": "method not allowed"})
+		return
+	}
+
+	var req struct {
+		Key     string `json:"key"`
+		Email   string `json:"email"`
+		RefID   string `json:"refId"`
+		Product string `json:"product"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]any{"success": false, "error": "invalid JSON"})
+		return
+	}
+
+	if req.Key != secretKey() {
+		writeJSON(w, 401, map[string]any{"success": false, "error": "Unauthorized"})
+		return
+	}
+
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	if email == "" || !strings.Contains(email, "@") {
+		writeJSON(w, 400, map[string]any{"success": false, "error": "email tidak valid"})
+		return
+	}
+
+	refID   := req.RefID
+	product := req.Product
+	if refID == ""   { refID = "manual-add" }
+	if product == "" { product = "Pebisnice Template" }
+
+	authorizeEmail(email, refID, product)
+	log.Printf("[ADMIN] Email ditambahkan manual: %s", email)
+
+	writeJSON(w, 200, map[string]any{
+		"success": true,
+		"message": fmt.Sprintf("Email %s berhasil ditambahkan", email),
+		"email":   email,
+	})
+}
+
+// ════════════════════════════════════════════════════════════════
 // MAIN
 // ════════════════════════════════════════════════════════════════
 
@@ -968,7 +1032,11 @@ func main() {
 		port = "8080"
 	}
 
-	// Restore authorized emails dari disk (survive restart)
+	// Log env check untuk debug
+	log.Printf("[CONFIG] DATABASE_URL set: %v", os.Getenv("DATABASE_URL") != "")
+	log.Printf("[CONFIG] SECRET_KEY set: %v", os.Getenv("SECRET_KEY") != "")
+	log.Printf("[CONFIG] LYNK_WEBHOOK_TOKEN set: %v", os.Getenv("LYNK_WEBHOOK_TOKEN") != "")
+
 	// Init Supabase PostgreSQL
 	if err := initDB(); err != nil {
 		log.Printf("[DB] Warning: %v — berjalan tanpa database", err)
@@ -977,11 +1045,12 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health",   corsMiddleware(handleHealth))
-	mux.HandleFunc("/webhook",  corsMiddleware(handleWebhook))
-	mux.HandleFunc("/activate", corsMiddleware(handleActivate))
-	mux.HandleFunc("/parse",    corsMiddleware(handleParse))
-	mux.HandleFunc("/",         corsMiddleware(handleHealth))
+	mux.HandleFunc("/health",            corsMiddleware(handleHealth))
+	mux.HandleFunc("/webhook",           corsMiddleware(handleWebhook))
+	mux.HandleFunc("/activate",          corsMiddleware(handleActivate))
+	mux.HandleFunc("/parse",             corsMiddleware(handleParse))
+	mux.HandleFunc("/admin/authorize",   corsMiddleware(handleAdminAuthorize))
+	mux.HandleFunc("/",                  corsMiddleware(handleHealth))
 
 	log.Printf("🚀 Pebisnice Backend v7 — port %s", port)
 	log.Printf("   /webhook   — Lynk.id payment event")
