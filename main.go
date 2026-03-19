@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,20 +14,158 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/xuri/excelize/v2"
 )
 
-// ── Config ────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════
+// CONFIG
+// ════════════════════════════════════════════════════════════════
+
 func secretKey() string {
 	k := os.Getenv("SECRET_KEY")
 	if k == "" {
-		k = "pebisnice_dev_key"
+		return "pebisnice_dev_key"
 	}
 	return k
 }
 
-// ── Field Aliases ─────────────────────────────────────────────
+// Token dari Lynk.id dashboard → Webhook Settings → Token
+func lynkWebhookToken() string {
+	return os.Getenv("LYNK_WEBHOOK_TOKEN")
+}
+
+// File JSON untuk persist authorized emails (survive Leapcell restart)
+const authorizedEmailsFile = "/tmp/pb_authorized_emails.json"
+
+// ════════════════════════════════════════════════════════════════
+// AUTHORIZED EMAILS STORE
+// In-memory + file persistence
+// ════════════════════════════════════════════════════════════════
+
+type PurchaseRecord struct {
+	Email       string    `json:"email"`
+	RefID       string    `json:"refId"`
+	ProductName string    `json:"productName"`
+	PurchasedAt time.Time `json:"purchasedAt"`
+	ExpiresAt   time.Time `json:"expiresAt"`
+}
+
+var (
+	emailStoreMu    sync.RWMutex
+	authorizedEmails = map[string]*PurchaseRecord{} // key: email lowercase
+)
+
+// Load dari file saat startup (restore setelah restart)
+func loadAuthorizedEmails() {
+	data, err := os.ReadFile(authorizedEmailsFile)
+	if err != nil {
+		return // file belum ada, normal
+	}
+	emailStoreMu.Lock()
+	defer emailStoreMu.Unlock()
+	var records []*PurchaseRecord
+	if err := json.Unmarshal(data, &records); err != nil {
+		log.Printf("[STORE] Gagal load authorized emails: %v", err)
+		return
+	}
+	now := time.Now()
+	loaded := 0
+	for _, r := range records {
+		if r.ExpiresAt.After(now) {
+			authorizedEmails[r.Email] = r
+			loaded++
+		}
+	}
+	log.Printf("[STORE] Loaded %d authorized emails from disk", loaded)
+}
+
+// Simpan ke file (dipanggil setiap kali ada perubahan)
+func persistAuthorizedEmails() {
+	emailStoreMu.RLock()
+	records := make([]*PurchaseRecord, 0, len(authorizedEmails))
+	for _, r := range authorizedEmails {
+		records = append(records, r)
+	}
+	emailStoreMu.RUnlock()
+
+	data, err := json.Marshal(records)
+	if err != nil {
+		log.Printf("[STORE] Gagal marshal emails: %v", err)
+		return
+	}
+	if err := os.WriteFile(authorizedEmailsFile, data, 0600); err != nil {
+		log.Printf("[STORE] Gagal write file: %v", err)
+	}
+}
+
+// Tambah email baru dari webhook
+func authorizeEmail(email, refID, productName string) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	emailStoreMu.Lock()
+	authorizedEmails[email] = &PurchaseRecord{
+		Email:       email,
+		RefID:       refID,
+		ProductName: productName,
+		PurchasedAt: time.Now(),
+		ExpiresAt:   time.Now().Add(90 * 24 * time.Hour), // 90 hari
+	}
+	emailStoreMu.Unlock()
+	log.Printf("[AUTHORIZE] email=%s refId=%s", email, refID)
+	go persistAuthorizedEmails()
+}
+
+// Cek apakah email sudah beli
+func isEmailAuthorized(email string) *PurchaseRecord {
+	email = strings.ToLower(strings.TrimSpace(email))
+	emailStoreMu.RLock()
+	defer emailStoreMu.RUnlock()
+	r, ok := authorizedEmails[email]
+	if !ok || r.ExpiresAt.Before(time.Now()) {
+		return nil
+	}
+	return r
+}
+
+// ════════════════════════════════════════════════════════════════
+// HMAC TOKEN — stateless per spreadsheetId
+// ════════════════════════════════════════════════════════════════
+
+func generateToken(spreadsheetId string) string {
+	mac := hmac.New(sha256.New, []byte(secretKey()))
+	mac.Write([]byte(spreadsheetId))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func validateToken(spreadsheetId, token string) bool {
+	expected := generateToken(spreadsheetId)
+	return hmac.Equal([]byte(token), []byte(expected))
+}
+
+// ════════════════════════════════════════════════════════════════
+// BLOCKLIST — SpreadsheetId
+// Set env BLOCKED_IDS="id1,id2" di Leapcell → cabut akses instan
+// ════════════════════════════════════════════════════════════════
+
+func isBlocked(spreadsheetId string) bool {
+	raw := os.Getenv("BLOCKED_IDS")
+	if raw == "" {
+		return false
+	}
+	for _, id := range strings.Split(raw, ",") {
+		if strings.TrimSpace(id) == spreadsheetId {
+			return true
+		}
+	}
+	return false
+}
+
+// ════════════════════════════════════════════════════════════════
+// FIELD ALIASES — Shopee export columns
+// ════════════════════════════════════════════════════════════════
+
 var orderFieldAliases = map[string][]string{
 	"noPesanan":    {"No. Pesanan", "Order ID", "No Pesanan"},
 	"waktuDibuat":  {"Waktu Pesanan Dibuat", "Tanggal Pesanan Dibuat", "Order Date"},
@@ -54,7 +195,10 @@ var incomeLabelAliases = map[string][]string{
 
 var criticalFields = []string{"noPesanan", "namaProduk", "qty", "totalHarga", "totalBayar"}
 
-// ── Types ─────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════
+// TYPES
+// ════════════════════════════════════════════════════════════════
+
 type OrderItem struct {
 	NoPesanan    string  `json:"noPesanan"`
 	WaktuDibuat  string  `json:"waktuDibuat"`
@@ -83,14 +227,45 @@ type IncomeData struct {
 	TotalDilepas     *float64 `json:"totalDilepas"`
 }
 
-type RequestBody struct {
-	Key        string `json:"key"`
-	Type       string `json:"type"`
-	FileBase64 string `json:"fileBase64"`
-	FileName   string `json:"fileName"`
+// Lynk.id webhook payload
+type LynkWebhookPayload struct {
+	Event string `json:"event"`
+	Data  struct {
+		MessageAction string `json:"message_action"`
+		MessageData   struct {
+			RefID    string `json:"refId"`
+			Customer struct {
+				Email string `json:"email"`
+				Name  string `json:"name"`
+			} `json:"customer"`
+			Items []struct {
+				Title string `json:"title"`
+				Price int    `json:"price"`
+				Qty   int    `json:"qty"`
+			} `json:"items"`
+		} `json:"message_data"`
+	} `json:"data"`
 }
 
-// ── Helpers ───────────────────────────────────────────────────
+type ActivateRequest struct {
+	Key           string `json:"key"`
+	SpreadsheetId string `json:"spreadsheetId"`
+	Email         string `json:"email"` // Gmail buyer dari Session.getActiveUser()
+}
+
+type ParseRequest struct {
+	Key           string `json:"key"`
+	Token         string `json:"token"`
+	SpreadsheetId string `json:"spreadsheetId"`
+	Type          string `json:"type"`
+	FileBase64    string `json:"fileBase64"`
+	FileName      string `json:"fileName"`
+}
+
+// ════════════════════════════════════════════════════════════════
+// HELPERS
+// ════════════════════════════════════════════════════════════════
+
 func strip(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.TrimLeft(s, "'")
@@ -225,7 +400,10 @@ func detectRibuan(rows [][]string, headerIdx, col int) bool {
 	return samples[len(samples)/2] < 1000
 }
 
-// ── Parse Order ───────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════
+// PARSE ORDER
+// ════════════════════════════════════════════════════════════════
+
 func parseOrder(b64 string) ([]OrderItem, int, string, error) {
 	f, path, err := openXlsx(b64)
 	if err != nil {
@@ -247,7 +425,6 @@ func parseOrder(b64 string) ([]OrderItem, int, string, error) {
 	headers := rows[hIdx]
 	colIdx := buildColIdx(headers)
 
-	// Validate critical
 	var missing []string
 	for _, field := range criticalFields {
 		if i, ok := colIdx[field]; !ok || i < 0 {
@@ -283,13 +460,17 @@ func parseOrder(b64 string) ([]OrderItem, int, string, error) {
 		qty, _ := toNum(getCell(row, colIdx, "qty"))
 		totalHarga, _ := toNum(getCell(row, colIdx, "totalHarga"))
 		totalBayar, _ := toNum(getCell(row, colIdx, "totalBayar"))
-		skuRef   := getCell(row, colIdx, "skuRef")
+		skuRef := getCell(row, colIdx, "skuRef")
 		skuInduk := getCell(row, colIdx, "skuInduk")
 		namaProd := getCell(row, colIdx, "namaProduk")
 
 		skuForHpp := skuRef
-		if skuForHpp == "" { skuForHpp = skuInduk }
-		if skuForHpp == "" { skuForHpp = namaProd }
+		if skuForHpp == "" {
+			skuForHpp = skuInduk
+		}
+		if skuForHpp == "" {
+			skuForHpp = namaProd
+		}
 
 		orders = append(orders, OrderItem{
 			NoPesanan:    noPesanan,
@@ -318,7 +499,10 @@ func parseOrder(b64 string) ([]OrderItem, int, string, error) {
 	return orders, len(uniqueMap), warn, nil
 }
 
-// ── Parse Income ──────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════
+// PARSE INCOME
+// ════════════════════════════════════════════════════════════════
+
 func parseIncome(b64 string) (*IncomeData, string, string, string, error) {
 	f, path, err := openXlsx(b64)
 	if err != nil {
@@ -332,7 +516,6 @@ func parseIncome(b64 string) (*IncomeData, string, string, string, error) {
 		return nil, "", "", "", err
 	}
 
-	// Rightmost numeric value per row → label map
 	numMap := map[string]float64{}
 	strMap := map[string]string{}
 
@@ -397,7 +580,10 @@ func parseIncome(b64 string) (*IncomeData, string, string, string, error) {
 		nil
 }
 
-// ── Handlers ──────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════
+// CORS MIDDLEWARE
+// ════════════════════════════════════════════════════════════════
+
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -411,9 +597,163 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// ════════════════════════════════════════════════════════════════
+// HANDLER: /health
+// ════════════════════════════════════════════════════════════════
+
 func handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]string{"status": "ok", "service": "pebisnice-backend"})
+	emailStoreMu.RLock()
+	count := len(authorizedEmails)
+	emailStoreMu.RUnlock()
+	writeJSON(w, 200, map[string]any{
+		"status":           "ok",
+		"service":          "pebisnice-backend",
+		"authorizedEmails": count,
+	})
 }
+
+// ════════════════════════════════════════════════════════════════
+// HANDLER: /webhook  (Lynk.id payment webhook)
+// ════════════════════════════════════════════════════════════════
+// Setup di Lynk.id dashboard:
+//   Webhook URL : https://sheet-api.pebisnice.my.id/webhook
+//   Event       : payment.received
+//   Token       : isi bebas → set ke env var LYNK_WEBHOOK_TOKEN di Leapcell
+
+func handleWebhook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"success": false, "error": "method not allowed"})
+		return
+	}
+
+	// Verifikasi Lynk.id signature
+	// Header: X-Lynk-Signature: <token yang kamu set di Lynk.id dashboard>
+	expectedToken := lynkWebhookToken()
+	if expectedToken != "" {
+		signature := r.Header.Get("X-Lynk-Signature")
+		if signature != expectedToken {
+			log.Printf("[WEBHOOK] Invalid signature: %q", signature)
+			writeJSON(w, 401, map[string]any{"success": false, "error": "invalid signature"})
+			return
+		}
+	}
+
+	var payload LynkWebhookPayload
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, 400, map[string]any{"success": false, "error": "invalid JSON"})
+		return
+	}
+
+	// Hanya proses event payment.received dengan status SUCCESS
+	if payload.Event != "payment.received" {
+		writeJSON(w, 200, map[string]any{"success": true, "note": "event ignored"})
+		return
+	}
+	if payload.Data.MessageAction != "SUCCESS" {
+		writeJSON(w, 200, map[string]any{"success": true, "note": "non-success payment ignored"})
+		return
+	}
+
+	email := strings.ToLower(strings.TrimSpace(payload.Data.MessageData.Customer.Email))
+	if email == "" {
+		writeJSON(w, 400, map[string]any{"success": false, "error": "customer email kosong"})
+		return
+	}
+
+	refID := payload.Data.MessageData.RefID
+	productName := ""
+	if len(payload.Data.MessageData.Items) > 0 {
+		productName = payload.Data.MessageData.Items[0].Title
+	}
+
+	authorizeEmail(email, refID, productName)
+
+	log.Printf("[WEBHOOK] ✅ Pembayaran diterima — email=%s refId=%s produk=%q",
+		email, refID, productName)
+
+	writeJSON(w, 200, map[string]any{
+		"success": true,
+		"message": fmt.Sprintf("Email %s berhasil diotorisasi", email),
+	})
+}
+
+// ════════════════════════════════════════════════════════════════
+// HANDLER: /activate
+// Dipanggil dari initSheets() di Google Apps Script
+// Menerima email Google user + spreadsheetId
+// ════════════════════════════════════════════════════════════════
+
+func handleActivate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"success": false, "error": "method not allowed"})
+		return
+	}
+
+	var req ActivateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]any{"success": false, "error": "invalid JSON"})
+		return
+	}
+
+	// Validasi secret key (tidak dilihat buyer — ada di ClientCode.gs)
+	if req.Key != secretKey() {
+		writeJSON(w, 401, map[string]any{"success": false, "error": "Unauthorized"})
+		return
+	}
+
+	if req.SpreadsheetId == "" || req.Email == "" {
+		writeJSON(w, 400, map[string]any{"success": false, "error": "spreadsheetId dan email wajib diisi"})
+		return
+	}
+
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+
+	// Cek blocklist
+	if isBlocked(req.SpreadsheetId) {
+		writeJSON(w, 403, map[string]any{
+			"success": false,
+			"error":   "Akses diblokir. Hubungi support di lynk.id/pebisnice",
+		})
+		return
+	}
+
+	// Cek apakah email sudah beli di Lynk.id
+	record := isEmailAuthorized(email)
+	if record == nil {
+		log.Printf("[ACTIVATE] DENIED — email=%s spreadsheetId=%s", email, req.SpreadsheetId)
+		writeJSON(w, 403, map[string]any{
+			"success": false,
+			"error": fmt.Sprintf(
+				"Email %s belum terdaftar sebagai pembeli Pebisnice.\n\n"+
+					"Pastikan kamu:\n"+
+					"1. Sudah membeli di lynk.id/pebisnice\n"+
+					"2. Membuka Google Sheets dengan email yang sama saat membeli\n\n"+
+					"Jika sudah beli tapi masih error, hubungi @pebisnice di Instagram.",
+				email,
+			),
+		})
+		return
+	}
+
+	// Email valid → generate token HMAC(spreadsheetId)
+	token := generateToken(req.SpreadsheetId)
+	log.Printf("[ACTIVATE] ✅ email=%s spreadsheetId=%s", email, req.SpreadsheetId)
+
+	writeJSON(w, 200, map[string]any{
+		"success": true,
+		"token":   token,
+		"message": fmt.Sprintf("Aktivasi berhasil! Selamat datang di Pebisnice 🎉"),
+		"buyer": map[string]any{
+			"email":       record.Email,
+			"productName": record.ProductName,
+			"purchasedAt": record.PurchasedAt.Format("02 Jan 2006"),
+		},
+	})
+}
+
+// ════════════════════════════════════════════════════════════════
+// HANDLER: /parse
+// ════════════════════════════════════════════════════════════════
 
 func handleParse(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -421,7 +761,7 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req RequestBody
+	var req ParseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]any{"success": false, "error": "invalid JSON"})
 		return
@@ -429,6 +769,32 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 
 	if req.Key != secretKey() {
 		writeJSON(w, 401, map[string]any{"success": false, "error": "Unauthorized"})
+		return
+	}
+
+	// Validasi token HMAC (stateless — tidak butuh database)
+	if req.Token == "" || req.SpreadsheetId == "" {
+		writeJSON(w, 401, map[string]any{
+			"success": false,
+			"error":   "Template belum diaktivasi. Jalankan menu ⚙️ Inisialisasi Sheet.",
+		})
+		return
+	}
+
+	if !validateToken(req.SpreadsheetId, req.Token) {
+		log.Printf("[PARSE] INVALID TOKEN — spreadsheetId=%s", req.SpreadsheetId)
+		writeJSON(w, 401, map[string]any{
+			"success": false,
+			"error":   "Lisensi tidak valid. Jalankan ulang ⚙️ Inisialisasi Sheet atau beli template asli di lynk.id/pebisnice",
+		})
+		return
+	}
+
+	if isBlocked(req.SpreadsheetId) {
+		writeJSON(w, 403, map[string]any{
+			"success": false,
+			"error":   "Akses diblokir. Hubungi support di lynk.id/pebisnice",
+		})
 		return
 	}
 
@@ -476,19 +842,35 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ── Main ──────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════
+// MAIN
+// ════════════════════════════════════════════════════════════════
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", corsMiddleware(handleHealth))
-	mux.HandleFunc("/parse",  corsMiddleware(handleParse))
-	mux.HandleFunc("/",       corsMiddleware(handleHealth))
+	// Restore authorized emails dari disk (survive restart)
+	loadAuthorizedEmails()
 
-	log.Printf("🚀 Pebisnice Backend — port %s", port)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health",   corsMiddleware(handleHealth))
+	mux.HandleFunc("/webhook",  corsMiddleware(handleWebhook))
+	mux.HandleFunc("/activate", corsMiddleware(handleActivate))
+	mux.HandleFunc("/parse",    corsMiddleware(handleParse))
+	mux.HandleFunc("/",         corsMiddleware(handleHealth))
+
+	log.Printf("🚀 Pebisnice Backend v7 — port %s", port)
+	log.Printf("   /webhook   — Lynk.id payment event")
+	log.Printf("   /activate  — registrasi token (verifikasi email Lynk.id vs Google)")
+	log.Printf("   /parse     — proses file xlsx")
+
+	if lynkWebhookToken() == "" {
+		log.Println("⚠️  LYNK_WEBHOOK_TOKEN tidak diset — webhook tidak terverifikasi")
+	}
+
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Server gagal: %v", err)
 	}
