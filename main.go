@@ -334,8 +334,9 @@ var criticalFields = []string{"noPesanan", "namaProduk", "qty", "totalHarga", "t
 type OrderItem struct {
 	NoPesanan    string  `json:"noPesanan"`
 	WaktuDibuat  string  `json:"waktuDibuat"`
-	WaktuSelesai string  `json:"waktuSelesai"`
-	Status       string  `json:"status"`
+	WaktuSelesai  string  `json:"waktuSelesai"`
+	Status        string  `json:"status"`
+	IsCancelled   bool    `json:"isCancelled"`
 	SkuInduk     string  `json:"skuInduk"`
 	NamaProduk   string  `json:"namaProduk"`
 	SkuRef       string  `json:"skuRef"`
@@ -581,6 +582,8 @@ func parseOrder(b64 string) ([]OrderItem, int, string, error) {
 	nonSelesai := 0
 	uniqueMap := map[string]bool{}
 
+	cancelled := map[string]bool{"Batal": true, "Cancelled": true, "BATAL": true, "Dibatalkan": true}
+
 	for _, row := range rows[hIdx+1:] {
 		noPesanan := getCell(row, colIdx, "noPesanan")
 		if noPesanan == "" {
@@ -613,6 +616,7 @@ func parseOrder(b64 string) ([]OrderItem, int, string, error) {
 			WaktuDibuat:  getCell(row, colIdx, "waktuDibuat"),
 			WaktuSelesai: getCell(row, colIdx, "waktuSelesai"),
 			Status:       status,
+			IsCancelled:  cancelled[status],
 			SkuInduk:     skuInduk,
 			NamaProduk:   namaProd,
 			SkuRef:       skuRef,
