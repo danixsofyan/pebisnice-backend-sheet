@@ -294,18 +294,14 @@ func validateToken(spreadsheetId, token string) (bool, string, string) {
 
 // checkRateLimit: max 60 request per menit per token
 func checkRateLimit(token string) bool {
-	if db == nil {
-		return true
-	}
+	if db == nil { return true }
 	var count int
 	err := db.QueryRow(`
 		SELECT COALESCE(SUM(request_count), 0) FROM rate_limits
 		WHERE token=$1 AND window_start > NOW() - INTERVAL '1 minute'`,
 		token,
 	).Scan(&count)
-	if err != nil || count >= 60 {
-		return false
-	}
+	if err != nil || count >= 60 { return false }
 
 	// Insert atau update window
 	db.Exec(`
@@ -408,9 +404,9 @@ var criticalFields = []string{"noPesanan", "namaProduk", "qty", "totalHarga", "t
 type OrderItem struct {
 	NoPesanan    string  `json:"noPesanan"`
 	WaktuDibuat  string  `json:"waktuDibuat"`
-	WaktuSelesai string  `json:"waktuSelesai"`
-	Status       string  `json:"status"`
-	IsCancelled  bool    `json:"isCancelled"`
+	WaktuSelesai  string  `json:"waktuSelesai"`
+	Status        string  `json:"status"`
+	IsCancelled   bool    `json:"isCancelled"`
 	SkuInduk     string  `json:"skuInduk"`
 	NamaProduk   string  `json:"namaProduk"`
 	SkuRef       string  `json:"skuRef"`
@@ -465,38 +461,38 @@ type ActivateRequest struct {
 }
 
 type ParseRequest struct {
-	Token         string        `json:"token"`
-	SpreadsheetId string        `json:"spreadsheetId"`
-	Type          string        `json:"type"`
-	FileBase64    string        `json:"fileBase64"`
-	FileName      string        `json:"fileName"`
-	Context       *SheetContext `json:"context,omitempty"`
+	Token         string          `json:"token"`
+	SpreadsheetId string          `json:"spreadsheetId"`
+	Type          string          `json:"type"`
+	FileBase64    string          `json:"fileBase64"`
+	FileName      string          `json:"fileName"`
+	Context       *SheetContext   `json:"context,omitempty"`
 }
 
 // SheetContext: state sheet yang dikirim client untuk diproses backend
 type SheetContext struct {
-	HppData       []HppRow `json:"hppData"`       // Master HPP rows
-	LastOrderRow  int      `json:"lastOrderRow"`  // baris terakhir Rekap Penjualan
-	LastIncomeRow int      `json:"lastIncomeRow"` // baris terakhir Rekap Pencairan
+	HppData      []HppRow `json:"hppData"`      // Master HPP rows
+	LastOrderRow int      `json:"lastOrderRow"`  // baris terakhir Rekap Penjualan
+	LastIncomeRow int     `json:"lastIncomeRow"` // baris terakhir Rekap Pencairan
 }
 
 type HppRow struct {
-	Row          int     `json:"row"`
-	SkuInduk     string  `json:"skuInduk"`
-	SkuRef       string  `json:"skuRef"`
-	NamaProd     string  `json:"namaProd"`
-	BerlakuMulai string  `json:"berlakuMulai"`
-	Hpp          float64 `json:"hpp"`
+	Row       int     `json:"row"`
+	SkuInduk  string  `json:"skuInduk"`
+	SkuRef    string  `json:"skuRef"`
+	NamaProd  string  `json:"namaProd"`
+	BerlakuMulai string `json:"berlakuMulai"`
+	Hpp       float64 `json:"hpp"`
 }
 
 // WriteInstruction: instruksi tulis yang dikirim ke client
 type WriteInstruction struct {
-	Sheet    string          `json:"sheet"`
-	StartRow int             `json:"startRow"`
-	StartCol int             `json:"startCol"`
-	Values   [][]interface{} `json:"values"`
-	Append   bool            `json:"append,omitempty"`
-	Formats  *CellFormats    `json:"formats,omitempty"`
+	Sheet     string          `json:"sheet"`
+	StartRow  int             `json:"startRow"`
+	StartCol  int             `json:"startCol"`
+	Values    [][]interface{} `json:"values"`
+	Append    bool            `json:"append,omitempty"`
+	Formats   *CellFormats    `json:"formats,omitempty"`
 }
 
 type CellFormats struct {
@@ -508,9 +504,9 @@ type CellFormats struct {
 
 // HppPopupItem: item untuk popup HPP di sidebar
 type HppPopupItem struct {
-	Row        int    `json:"row"`
-	SkuInduk   string `json:"skuInduk"`
-	SkuRef     string `json:"skuRef"`
+	Row       int    `json:"row"`
+	SkuInduk  string `json:"skuInduk"`
+	SkuRef    string `json:"skuRef"`
 	NamaProduk string `json:"namaProduk"`
 }
 
@@ -698,6 +694,7 @@ func parseOrder(b64 string) ([]OrderItem, int, string, error) {
 	uniqueMap := map[string]bool{}
 
 	cancelled := map[string]bool{"Batal": true, "Cancelled": true, "BATAL": true, "Dibatalkan": true}
+	cancelledOrders := map[string]bool{} // track unique cancelled orders
 
 	for _, row := range rows[hIdx+1:] {
 		noPesanan := getCell(row, colIdx, "noPesanan")
@@ -707,7 +704,8 @@ func parseOrder(b64 string) ([]OrderItem, int, string, error) {
 		uniqueMap[noPesanan] = true
 
 		status := getCell(row, colIdx, "status")
-		if status != "" && !completed[status] {
+		if status != "" && !completed[status] && !cancelledOrders[noPesanan] {
+			cancelledOrders[noPesanan] = true
 			nonSelesai++
 		}
 
@@ -749,7 +747,7 @@ func parseOrder(b64 string) ([]OrderItem, int, string, error) {
 
 	warn := ""
 	if nonSelesai > 0 {
-		warn = fmt.Sprintf("%d order bukan Selesai ikut terimport", nonSelesai)
+		warn = fmt.Sprintf("%d order berstatus Batal — omzet tidak dihitung", nonSelesai)
 	}
 	return orders, len(uniqueMap), warn, nil
 }
@@ -920,12 +918,12 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if merchantKey != "" {
-		refID := payload.Data.MessageData.RefID
+		refID     := payload.Data.MessageData.RefID
 		messageID := payload.Data.MessageID
-		amount := strconv.Itoa(payload.Data.MessageData.Totals.GrandTotal)
+		amount    := strconv.Itoa(payload.Data.MessageData.Totals.GrandTotal)
 
 		sigInput := amount + refID + messageID + merchantKey
-		h := sha256.New()
+		h        := sha256.New()
 		h.Write([]byte(sigInput))
 		expectedSig := hex.EncodeToString(h.Sum(nil))
 
@@ -1080,9 +1078,7 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 	if !valid {
 		log.Printf("[PARSE] INVALID TOKEN — spreadsheetId=%s reason=%s", req.SpreadsheetId, validErr)
 		code := 401
-		if validErr == "terlalu banyak request. Tunggu beberapa saat" {
-			code = 429
-		}
+		if validErr == "terlalu banyak request. Tunggu beberapa saat" { code = 429 }
 		writeJSON(w, code, map[string]any{
 			"success": false,
 			"error":   validErr,
@@ -1143,14 +1139,14 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 
 		ts := fmt.Sprintf("%d", time.Now().Unix())
 		resp := map[string]any{
-			"success":      true,
-			"writes":       writes,
-			"hppPopup":     hppPopup,
-			"totalRows":    len(orders),
+			"success":    true,
+			"writes":     writes,
+			"hppPopup":   hppPopup,
+			"totalRows":  len(orders),
 			"uniqueOrders": uniqueOrders,
-			"toast":        fmt.Sprintf("✅ %d baris dari %d order berhasil diimport.", len(orders), uniqueOrders),
-			"ts":           ts,
-			"sig":          signResponse(req.Token, req.SpreadsheetId, ts),
+			"toast":      fmt.Sprintf("✅ %d baris dari %d order berhasil diimport.", len(orders), uniqueOrders),
+			"ts":         ts,
+			"sig":        signResponse(req.Token, req.SpreadsheetId, ts),
 		}
 		if warn != "" {
 			resp["warning"] = warn
@@ -1181,11 +1177,11 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 
 		ts := fmt.Sprintf("%d", time.Now().Unix())
 		writeJSON(w, 200, map[string]any{
-			"success": true,
-			"writes":  []WriteInstruction{incomeWrite, logWrite},
-			"toast":   fmt.Sprintf("✅ Penghasilan %s s/d %s berhasil diimport.", dari, ke),
-			"ts":      ts,
-			"sig":     signResponse(req.Token, req.SpreadsheetId, ts),
+			"success":  true,
+			"writes":   []WriteInstruction{incomeWrite, logWrite},
+			"toast":    fmt.Sprintf("✅ Penghasilan %s s/d %s berhasil diimport.", dari, ke),
+			"ts":       ts,
+			"sig":      signResponse(req.Token, req.SpreadsheetId, ts),
 		})
 
 	case "refreshHpp":
@@ -1243,14 +1239,10 @@ func handleAdminAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	refID := req.RefID
+	refID   := req.RefID
 	product := req.Product
-	if refID == "" {
-		refID = "manual-add"
-	}
-	if product == "" {
-		product = "Pebisnice Template"
-	}
+	if refID == ""   { refID = "manual-add" }
+	if product == "" { product = "Pebisnice Template" }
 
 	authorizeEmail(email, refID, product)
 	log.Printf("[ADMIN] Email ditambahkan manual: %s", email)
@@ -1266,19 +1258,14 @@ func handleAdminAuthorize(w http.ResponseWriter, r *http.Request) {
 // MAIN
 // ════════════════════════════════════════════════════════════════
 
+
 // ════════════════════════════════════════════════════════════════
 // WRITE INSTRUCTION BUILDERS
 // Semua logic ada di sini — client hanya terima dan eksekusi
 // ════════════════════════════════════════════════════════════════
 
-func buildHppHistoryFromContext(ctx *SheetContext) map[string][]struct {
-	date time.Time
-	hpp  float64
-} {
-	history := make(map[string][]struct {
-		date time.Time
-		hpp  float64
-	})
+func buildHppHistoryFromContext(ctx *SheetContext) map[string][]struct{ date time.Time; hpp float64 } {
+	history := make(map[string][]struct{ date time.Time; hpp float64 })
 	if ctx == nil {
 		return history
 	}
@@ -1296,10 +1283,7 @@ func buildHppHistoryFromContext(ctx *SheetContext) map[string][]struct {
 		if effDate.IsZero() {
 			effDate = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 		}
-		entry := struct {
-			date time.Time
-			hpp  float64
-		}{effDate, row.Hpp}
+		entry := struct{ date time.Time; hpp float64 }{effDate, row.Hpp}
 		for _, key := range []string{row.SkuInduk, row.SkuRef, row.NamaProd} {
 			if key != "" {
 				history[key] = append(history[key], entry)
@@ -1309,10 +1293,7 @@ func buildHppHistoryFromContext(ctx *SheetContext) map[string][]struct {
 	return history
 }
 
-func lookupHpp(history map[string][]struct {
-	date time.Time
-	hpp  float64
-}, key string, orderDate time.Time) float64 {
+func lookupHpp(history map[string][]struct{ date time.Time; hpp float64 }, key string, orderDate time.Time) float64 {
 	entries, ok := history[key]
 	if !ok || len(entries) == 0 {
 		return 0
@@ -1341,16 +1322,11 @@ func parseFlexDate(s string) (time.Time, error) {
 }
 
 func min(a, b int) int {
-	if a < b {
-		return a
-	}
+	if a < b { return a }
 	return b
 }
 
-func buildOrderWrites(orders []OrderItem, hppHistory map[string][]struct {
-	date time.Time
-	hpp  float64
-}, startRow int) ([]WriteInstruction, []HppPopupItem, []HppRow) {
+func buildOrderWrites(orders []OrderItem, hppHistory map[string][]struct{ date time.Time; hpp float64 }, startRow int) ([]WriteInstruction, []HppPopupItem, []HppRow) {
 	var rows [][]interface{}
 	var backgrounds, fontColors []string
 	var hppPopup []HppPopupItem
@@ -1369,20 +1345,12 @@ func buildOrderWrites(orders []OrderItem, hppHistory map[string][]struct {
 		}
 
 		skuForHpp := o.SkuForHpp
-		if skuForHpp == "" {
-			skuForHpp = o.SkuRef
-		}
-		if skuForHpp == "" {
-			skuForHpp = o.SkuInduk
-		}
+		if skuForHpp == "" { skuForHpp = o.SkuRef }
+		if skuForHpp == "" { skuForHpp = o.SkuInduk }
 
 		hpp := lookupHpp(hppHistory, skuForHpp, orderDate)
-		if hpp == 0 {
-			hpp = lookupHpp(hppHistory, o.SkuRef, orderDate)
-		}
-		if hpp == 0 {
-			hpp = lookupHpp(hppHistory, o.SkuInduk, orderDate)
-		}
+		if hpp == 0 { hpp = lookupHpp(hppHistory, o.SkuRef, orderDate) }
+		if hpp == 0 { hpp = lookupHpp(hppHistory, o.SkuInduk, orderDate) }
 
 		var totalHpp, grossProfit interface{}
 		var hppStatus string
@@ -1410,7 +1378,7 @@ func buildOrderWrites(orders []OrderItem, hppHistory map[string][]struct {
 					NamaProd: o.NamaProduk,
 				}
 				hppPopup = append(hppPopup, HppPopupItem{
-					Row:      startRow + len(rows), // akan diisi setelah write
+					Row: startRow + len(rows), // akan diisi setelah write
 					SkuInduk: o.SkuInduk, SkuRef: o.SkuRef, NamaProduk: o.NamaProduk,
 				})
 			}
@@ -1418,13 +1386,9 @@ func buildOrderWrites(orders []OrderItem, hppHistory map[string][]struct {
 
 		rowNum := startRow + i
 		var hppVal interface{}
-		if hpp > 0 && !o.IsCancelled {
-			hppVal = hpp
-		}
+		if hpp > 0 && !o.IsCancelled { hppVal = hpp }
 		var totalBayar float64
-		if !o.IsCancelled {
-			totalBayar = o.TotalBayar
-		}
+		if !o.IsCancelled { totalBayar = o.TotalBayar }
 
 		rows = append(rows, []interface{}{
 			o.WaktuDibuat, o.NoPesanan, o.SkuInduk, o.WaktuSelesai, o.Status,
@@ -1436,14 +1400,11 @@ func buildOrderWrites(orders []OrderItem, hppHistory map[string][]struct {
 
 		var bg, fc string
 		if o.IsCancelled {
-			bg = "#F1F5F9"
-			fc = "#94A3B8"
+			bg = "#F1F5F9"; fc = "#94A3B8"
 		} else if rowNum%2 == 0 {
-			bg = "#F8FAFC"
-			fc = ""
+			bg = "#F8FAFC"; fc = ""
 		} else {
-			bg = "#FFFFFF"
-			fc = ""
+			bg = "#FFFFFF"; fc = ""
 		}
 		backgrounds = append(backgrounds, bg)
 		fontColors = append(fontColors, fc)
@@ -1488,24 +1449,14 @@ func buildHppWrites(newRows []HppRow, startRow int) WriteInstruction {
 func buildIncomeWrites(inc *IncomeData, dari, ke string, startRow int) WriteInstruction {
 	periode := dari + " s/d " + ke
 	fv := func(p *float64) interface{} {
-		if p == nil {
-			return 0
-		}
+		if p == nil { return 0 }
 		return *p
 	}
 	biayaShopee := 0.0
-	if inc.BiayaKomisi != nil {
-		biayaShopee += math.Abs(*inc.BiayaKomisi)
-	}
-	if inc.BiayaAdmin != nil {
-		biayaShopee += math.Abs(*inc.BiayaAdmin)
-	}
-	if inc.BiayaLayanan != nil {
-		biayaShopee += math.Abs(*inc.BiayaLayanan)
-	}
-	if inc.BiayaProses != nil {
-		biayaShopee += math.Abs(*inc.BiayaProses)
-	}
+	if inc.BiayaKomisi != nil { biayaShopee += math.Abs(*inc.BiayaKomisi) }
+	if inc.BiayaAdmin != nil { biayaShopee += math.Abs(*inc.BiayaAdmin) }
+	if inc.BiayaLayanan != nil { biayaShopee += math.Abs(*inc.BiayaLayanan) }
+	if inc.BiayaProses != nil { biayaShopee += math.Abs(*inc.BiayaProses) }
 
 	return WriteInstruction{
 		Sheet: "Rekap Pencairan", StartRow: startRow, StartCol: 1,
@@ -1525,18 +1476,13 @@ func buildIncomeWrites(inc *IncomeData, dari, ke string, startRow int) WriteInst
 }
 
 func float64OrZero(p *float64) float64 {
-	if p == nil {
-		return 0
-	}
+	if p == nil { return 0 }
 	return *p
 }
 
-func buildRefreshHppWrites(ctx *SheetContext, hppHistory map[string][]struct {
-	date time.Time
-	hpp  float64
-}) (int, []WriteInstruction) {
+func buildRefreshHppWrites(ctx *SheetContext, hppHistory map[string][]struct{ date time.Time; hpp float64 }) (int, []WriteInstruction) {
 	type rowUpdate struct {
-		row                        int
+		row int
 		hpp, totalHpp, grossProfit float64
 	}
 	// ctx.HppData tidak punya Rekap Penjualan data — client harus kirim juga
@@ -1544,6 +1490,7 @@ func buildRefreshHppWrites(ctx *SheetContext, hppHistory map[string][]struct {
 	// Ini akan diimplementasi lebih lengkap di v2 backend
 	return 0, nil
 }
+
 
 // ════════════════════════════════════════════════════════════════
 // ADMIN ENDPOINTS
@@ -1668,16 +1615,16 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", corsMiddleware(handleHealth))
-	mux.HandleFunc("/webhook", corsMiddleware(handleWebhook))
-	mux.HandleFunc("/activate", corsMiddleware(handleActivate))
-	mux.HandleFunc("/parse", corsMiddleware(handleParse))
-	mux.HandleFunc("/admin/authorize", corsMiddleware(handleAdminAuthorize))
-	mux.HandleFunc("/admin/revoke", corsMiddleware(handleAdminRevoke))
+	mux.HandleFunc("/health",            corsMiddleware(handleHealth))
+	mux.HandleFunc("/webhook",           corsMiddleware(handleWebhook))
+	mux.HandleFunc("/activate",          corsMiddleware(handleActivate))
+	mux.HandleFunc("/parse",             corsMiddleware(handleParse))
+	mux.HandleFunc("/admin/authorize",   corsMiddleware(handleAdminAuthorize))
+	mux.HandleFunc("/admin/revoke",      corsMiddleware(handleAdminRevoke))
 	mux.HandleFunc("/admin/activations", corsMiddleware(handleAdminListActivations))
-	mux.HandleFunc("/", corsMiddleware(handleHealth))
+	mux.HandleFunc("/",                  corsMiddleware(handleHealth))
 
-	log.Printf("🚀 Pebisnice Backend — port %s", port)
+	log.Printf("🚀 Pebisnice Backend v7 — port %s", port)
 	log.Printf("   /webhook   — Lynk.id payment event")
 	log.Printf("   /activate  — registrasi token (verifikasi email Lynk.id vs Google)")
 	log.Printf("   /parse     — proses file xlsx")
