@@ -96,10 +96,19 @@ func initDB() error {
 			spreadsheet_id  TEXT PRIMARY KEY,
 			email           TEXT NOT NULL,
 			token           TEXT NOT NULL,
-			activated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			activated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			last_seen       TIMESTAMPTZ,
+			request_count   INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS activations_email_idx ON activations(email);
 		CREATE INDEX IF NOT EXISTS activations_token_idx ON activations(token);
+		-- Rate limiting table
+		CREATE TABLE IF NOT EXISTS rate_limits (
+			token           TEXT NOT NULL,
+			window_start    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			request_count   INTEGER NOT NULL DEFAULT 1,
+			PRIMARY KEY (token, window_start)
+		);
 	`)
 	if err != nil {
 		return fmt.Errorf("gagal buat tabel: %w", err)
@@ -246,40 +255,92 @@ func generateToken(spreadsheetId string) string {
 // Signature = SHA256(token + spreadsheetId + timestamp + secretKey)
 // ClientCode verifikasi ini — kalau response di-dummy, signature tidak cocok
 func signResponse(token, spreadsheetId, timestamp string) string {
+	// SHA256(token + spreadsheetId + ts)
+	// Token sudah unik per spreadsheet — tidak perlu tambahan secretKey
 	h := sha256.New()
-	h.Write([]byte(token + spreadsheetId + timestamp + secretKey()))
+	h.Write([]byte(token + spreadsheetId + timestamp))
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// validateToken: cek token di DB activations
-// return (valid bool, email string)
-func validateToken(spreadsheetId, token string) (bool, string) {
+// validateToken: cek token + expiry + rate limit + update stats
+// return (valid bool, email string, errMsg string)
+func validateToken(spreadsheetId, token string) (bool, string, string) {
 	if db == nil || spreadsheetId == "" || token == "" {
-		return false, ""
+		return false, "", "token atau spreadsheetId kosong"
 	}
+
 	var email string
 	err := db.QueryRow(
 		`SELECT email FROM activations WHERE spreadsheet_id=$1 AND token=$2`,
 		spreadsheetId, token,
 	).Scan(&email)
 	if err != nil {
-		return false, ""
+		return false, "", "lisensi tidak valid"
 	}
-	return true, email
+
+	// Cek rate limit: max 60 request per menit per token
+	if !checkRateLimit(token) {
+		return false, "", "terlalu banyak request. Tunggu beberapa saat"
+	}
+
+	// Update last_seen dan request_count (async)
+	go func() {
+		db.Exec(`UPDATE activations SET last_seen=NOW(), request_count=request_count+1
+				 WHERE spreadsheet_id=$1 AND token=$2`, spreadsheetId, token)
+	}()
+
+	return true, email, ""
 }
 
-// saveActivation: simpan token ke DB activations
-// Jika spreadsheetId sudah ada, update token (re-aktivasi)
+// checkRateLimit: max 60 request per menit per token
+func checkRateLimit(token string) bool {
+	if db == nil { return true }
+	var count int
+	err := db.QueryRow(`
+		SELECT COALESCE(SUM(request_count), 0) FROM rate_limits
+		WHERE token=$1 AND window_start > NOW() - INTERVAL '1 minute'`,
+		token,
+	).Scan(&count)
+	if err != nil || count >= 60 { return false }
+
+	// Insert atau update window
+	db.Exec(`
+		INSERT INTO rate_limits (token, window_start, request_count)
+		VALUES ($1, date_trunc('minute', NOW()), 1)
+		ON CONFLICT (token, window_start) DO UPDATE
+		SET request_count = rate_limits.request_count + 1`, token)
+	return true
+}
+
+const maxDevicesPerEmail = 1 // 1 email = 1 spreadsheet
+
+// saveActivation: simpan token ke DB
+// Batasi max 3 spreadsheet aktif per email
 func saveActivation(spreadsheetId, email, token string) error {
 	if db == nil {
 		return fmt.Errorf("database tidak tersedia")
 	}
+
+	// Cek apakah spreadsheetId sudah ada (re-aktivasi — selalu boleh)
+	var existing int
+	db.QueryRow(`SELECT COUNT(*) FROM activations WHERE spreadsheet_id=$1`, spreadsheetId).Scan(&existing)
+
+	if existing == 0 {
+		// Spreadsheet baru — cek limit per email
+		var activeCount int
+		db.QueryRow(`SELECT COUNT(*) FROM activations WHERE email=$1`, email).Scan(&activeCount)
+		if activeCount >= maxDevicesPerEmail {
+			return fmt.Errorf("batas %d spreadsheet aktif per akun tercapai. "+
+				"Hapus aktivasi lama atau hubungi support", maxDevicesPerEmail)
+		}
+	}
+
 	_, err := db.Exec(`
 		INSERT INTO activations (spreadsheet_id, email, token, activated_at)
 		VALUES ($1, $2, $3, NOW())
 		ON CONFLICT (spreadsheet_id) DO UPDATE SET
-			token = EXCLUDED.token,
-			email = EXCLUDED.email,
+			token        = EXCLUDED.token,
+			email        = EXCLUDED.email,
 			activated_at = NOW()
 	`, spreadsheetId, email, token)
 	return err
@@ -400,7 +461,6 @@ type ActivateRequest struct {
 }
 
 type ParseRequest struct {
-	Key           string          `json:"key"`
 	Token         string          `json:"token"`
 	SpreadsheetId string          `json:"spreadsheetId"`
 	Type          string          `json:"type"`
@@ -928,11 +988,6 @@ func handleActivate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validasi secret key (tidak dilihat buyer — ada di ClientCode.gs)
-	if req.Key != secretKey() {
-		writeJSON(w, 401, map[string]any{"success": false, "error": "Unauthorized"})
-		return
-	}
-
 	if req.SpreadsheetId == "" || req.Email == "" {
 		writeJSON(w, 400, map[string]any{"success": false, "error": "spreadsheetId dan email wajib diisi"})
 		return
@@ -1008,12 +1063,7 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Key != secretKey() {
-		writeJSON(w, 401, map[string]any{"success": false, "error": "Unauthorized"})
-		return
-	}
-
-	// Validasi token HMAC (stateless — tidak butuh database)
+	// Validasi token via database
 	if req.Token == "" || req.SpreadsheetId == "" {
 		writeJSON(w, 401, map[string]any{
 			"success": false,
@@ -1022,12 +1072,14 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	valid, tokenEmail := validateToken(req.SpreadsheetId, req.Token)
+	valid, tokenEmail, validErr := validateToken(req.SpreadsheetId, req.Token)
 	if !valid {
-		log.Printf("[PARSE] INVALID TOKEN — spreadsheetId=%s", req.SpreadsheetId)
-		writeJSON(w, 401, map[string]any{
+		log.Printf("[PARSE] INVALID TOKEN — spreadsheetId=%s reason=%s", req.SpreadsheetId, validErr)
+		code := 401
+		if validErr == "terlalu banyak request. Tunggu beberapa saat" { code = 429 }
+		writeJSON(w, code, map[string]any{
 			"success": false,
-			"error":   "Lisensi tidak valid. Jalankan ulang ⚙️ Inisialisasi Sheet atau beli template asli di lynk.id/pebisnice",
+			"error":   validErr,
 		})
 		return
 	}
@@ -1100,7 +1152,7 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, resp)
 
 	case "income":
-		inc, dari, ke, username, err := parseIncome(req.FileBase64)
+		inc, dari, ke, _, err := parseIncome(req.FileBase64)
 		if err != nil {
 			log.Printf("[ERROR] parseIncome: %v", err)
 			writeJSON(w, 200, map[string]any{"success": false, "error": err.Error()})
@@ -1317,7 +1369,7 @@ func buildOrderWrites(orders []OrderItem, hppHistory map[string][]struct{ date t
 		}
 
 		// Track SKU baru
-		if !o.IsCancelled && hpp == 0 && skuForHpp != "" && !newHppKeys[skuForHpp].SkuInduk != false {
+		if !o.IsCancelled && hpp == 0 && skuForHpp != "" {
 			if _, exists := newHppKeys[skuForHpp]; !exists {
 				newHppKeys[skuForHpp] = HppRow{
 					SkuInduk: o.SkuInduk, SkuRef: o.SkuRef,
@@ -1437,6 +1489,111 @@ func buildRefreshHppWrites(ctx *SheetContext, hppHistory map[string][]struct{ da
 	return 0, nil
 }
 
+
+// ════════════════════════════════════════════════════════════════
+// ADMIN ENDPOINTS
+// ════════════════════════════════════════════════════════════════
+
+// Revoke lisensi: hapus atau expire token tertentu
+func handleAdminRevoke(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"success": false, "error": "method not allowed"})
+		return
+	}
+	var req struct {
+		Key           string `json:"key"`
+		SpreadsheetId string `json:"spreadsheetId"`
+		Email         string `json:"email"` // revoke semua milik email ini
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]any{"success": false, "error": "invalid JSON"})
+		return
+	}
+	if req.Key != secretKey() {
+		writeJSON(w, 401, map[string]any{"success": false, "error": "Unauthorized"})
+		return
+	}
+	if db == nil {
+		writeJSON(w, 500, map[string]any{"success": false, "error": "database tidak tersedia"})
+		return
+	}
+
+	var result sql.Result
+	var err error
+	if req.SpreadsheetId != "" {
+		// Revoke specific spreadsheet
+		result, err = db.Exec(`DELETE FROM activations WHERE spreadsheet_id=$1`, req.SpreadsheetId)
+	} else if req.Email != "" {
+		// Revoke semua milik email
+		result, err = db.Exec(`DELETE FROM activations WHERE email=$1`, req.Email)
+	} else {
+		writeJSON(w, 400, map[string]any{"success": false, "error": "spreadsheetId atau email wajib diisi"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"success": false, "error": err.Error()})
+		return
+	}
+	affected, _ := result.RowsAffected()
+	log.Printf("[ADMIN] Revoke: spreadsheetId=%s email=%s affected=%d", req.SpreadsheetId, req.Email, affected)
+	writeJSON(w, 200, map[string]any{"success": true, "revoked": affected})
+}
+
+// List aktivasi: lihat semua aktivasi aktif
+func handleAdminListActivations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"success": false, "error": "method not allowed"})
+		return
+	}
+	var req struct {
+		Key   string `json:"key"`
+		Email string `json:"email"` // optional filter
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]any{"success": false, "error": "invalid JSON"})
+		return
+	}
+	if req.Key != secretKey() {
+		writeJSON(w, 401, map[string]any{"success": false, "error": "Unauthorized"})
+		return
+	}
+	if db == nil {
+		writeJSON(w, 500, map[string]any{"success": false, "error": "database tidak tersedia"})
+		return
+	}
+
+	query := `SELECT spreadsheet_id, email, activated_at, last_seen, request_count
+			  FROM activations`
+	args := []interface{}{}
+	if req.Email != "" {
+		query += ` AND email=$1`
+		args = append(args, req.Email)
+	}
+	query += ` ORDER BY activated_at DESC`
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"success": false, "error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	type ActivationRecord struct {
+		SpreadsheetId string     `json:"spreadsheetId"`
+		Email         string     `json:"email"`
+		ActivatedAt   time.Time  `json:"activatedAt"`
+		LastSeen      *time.Time `json:"lastSeen"`
+		RequestCount  int        `json:"requestCount"`
+	}
+	var list []ActivationRecord
+	for rows.Next() {
+		var a ActivationRecord
+		rows.Scan(&a.SpreadsheetId, &a.Email, &a.ActivatedAt, &a.LastSeen, &a.RequestCount)
+		list = append(list, a)
+	}
+	writeJSON(w, 200, map[string]any{"success": true, "activations": list, "count": len(list)})
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -1461,6 +1618,8 @@ func main() {
 	mux.HandleFunc("/activate",          corsMiddleware(handleActivate))
 	mux.HandleFunc("/parse",             corsMiddleware(handleParse))
 	mux.HandleFunc("/admin/authorize",   corsMiddleware(handleAdminAuthorize))
+	mux.HandleFunc("/admin/revoke",      corsMiddleware(handleAdminRevoke))
+	mux.HandleFunc("/admin/activations", corsMiddleware(handleAdminListActivations))
 	mux.HandleFunc("/",                  corsMiddleware(handleHealth))
 
 	log.Printf("🚀 Pebisnice Backend v7 — port %s", port)
