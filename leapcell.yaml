@@ -1,4 +1,0 @@
-build:
-  command: go mod tidy && go build -ldflags '-s -w' -o app
-run:
-  command: ./app
