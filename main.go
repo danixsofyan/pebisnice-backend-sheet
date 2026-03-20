@@ -1117,14 +1117,14 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 			startRow = req.Context.LastOrderRow + 1
 		}
 
-		writes, hppPopup, newHppRows := buildOrderWrites(orders, hppHistory, startRow)
+		hppStartRow := 5
+		if req.Context != nil && req.Context.HppData != nil {
+			hppStartRow = len(req.Context.HppData) + 5
+		}
+		writes, hppPopup, newHppRows := buildOrderWrites(orders, hppHistory, startRow, hppStartRow)
 
 		// Tambah write untuk Master HPP jika ada SKU baru
 		if len(newHppRows) > 0 {
-			hppStartRow := 5
-			if req.Context != nil && req.Context.HppData != nil {
-				hppStartRow = len(req.Context.HppData) + 5
-			}
 			writes = append(writes, buildHppWrites(newHppRows, hppStartRow))
 		}
 
@@ -1326,17 +1326,21 @@ func min(a, b int) int {
 	return b
 }
 
-func buildOrderWrites(orders []OrderItem, hppHistory map[string][]struct{ date time.Time; hpp float64 }, startRow int) ([]WriteInstruction, []HppPopupItem, []HppRow) {
+func buildOrderWrites(orders []OrderItem, hppHistory map[string][]struct{ date time.Time; hpp float64 }, startRow int, hppStartRow int) ([]WriteInstruction, []HppPopupItem, []HppRow) {
 	var rows [][]interface{}
 	var backgrounds, fontColors []string
 	var hppPopup []HppPopupItem
 	newHppKeys := make(map[string]HppRow)
 	existingHppKeys := make(map[string]bool)
 
-	// Build existing HPP key set
+	// Build existing HPP key set (keys yang sudah ada di Master HPP)
 	for key := range hppHistory {
 		existingHppKeys[key] = true
 	}
+
+	// Also build a set of ALL keys from context (even if hpp=0, SKU sudah ada di sheet)
+	// Ini untuk cegah duplikasi SKU yang sudah ada di Master HPP tapi HPP belum diisi
+	// (req.Context.HppData includes rows with hpp=0)
 
 	for i, o := range orders {
 		orderDate, _ := parseFlexDate(o.WaktuDibuat)
@@ -1370,16 +1374,19 @@ func buildOrderWrites(orders []OrderItem, hppHistory map[string][]struct{ date t
 			}
 		}
 
-		// Track SKU baru
-		if !o.IsCancelled && hpp == 0 && skuForHpp != "" {
+		// Track SKU baru — hanya tambahkan jika SKU BENAR-BENAR baru (tidak ada di existingHppKeys)
+		if !o.IsCancelled && hpp == 0 && skuForHpp != "" && !existingHppKeys[skuForHpp] &&
+			!existingHppKeys[o.SkuRef] && !existingHppKeys[o.SkuInduk] {
 			if _, exists := newHppKeys[skuForHpp]; !exists {
 				newHppKeys[skuForHpp] = HppRow{
 					SkuInduk: o.SkuInduk, SkuRef: o.SkuRef,
 					NamaProd: o.NamaProduk,
 				}
 				hppPopup = append(hppPopup, HppPopupItem{
-					Row: startRow + len(rows), // akan diisi setelah write
-					SkuInduk: o.SkuInduk, SkuRef: o.SkuRef, NamaProduk: o.NamaProduk,
+					Row:        hppStartRow + len(newHppKeys) - 1, // row di sheet Master HPP
+					SkuInduk:   o.SkuInduk,
+					SkuRef:     o.SkuRef,
+					NamaProduk: o.NamaProduk,
 				})
 			}
 		}
@@ -1391,11 +1398,22 @@ func buildOrderWrites(orders []OrderItem, hppHistory map[string][]struct{ date t
 		if !o.IsCancelled { totalBayar = o.TotalBayar }
 
 		rows = append(rows, []interface{}{
-			o.WaktuDibuat, o.NoPesanan, o.SkuInduk, o.WaktuSelesai, o.Status,
-			o.NamaProduk, o.SkuRef, o.Variasi, o.Qty,
-			omzet, omzet,
-			hppVal, totalHpp, grossProfit,
-			totalBayar, hppStatus,
+			"",            // A = NO (formula diset oleh executeWrites)
+			o.NoPesanan,   // B = NO. PESANAN
+			o.SkuInduk,    // C = SKU INDUK
+			o.WaktuDibuat, // D = TGL DIBUAT
+			o.WaktuSelesai,// E = TGL SELESAI
+			o.NamaProduk,  // F = NAMA PRODUK
+			o.SkuRef,      // G = SKU / REF
+			o.Variasi,     // H = VARIASI
+			o.Qty,         // I = QTY
+			omzet,         // J = OMZET (RP)
+			omzet,         // K = OMZET TOTAL (RP)
+			hppVal,        // L = HPP/UNIT
+			totalHpp,      // M = TOTAL HPP
+			grossProfit,   // N = GROSS PROFIT
+			totalBayar,    // O = NET/ORDER
+			hppStatus,     // P = STATUS HPP
 		})
 
 		var bg, fc string
@@ -1421,7 +1439,7 @@ func buildOrderWrites(orders []OrderItem, hppHistory map[string][]struct{ date t
 		StartCol: 1,
 		Values:   rows,
 		Formats: &CellFormats{
-			NumberFormats: []string{"", "", "", "", "", "", "", "", `#,##0`, `#,##0;(#,##0);"-"`, `#,##0;(#,##0);"-"`, `#,##0;(#,##0);"-"`, `#,##0;(#,##0);"-"`, `#,##0;(#,##0);"-"`, `#,##0;(#,##0);"-"`, ""},
+			NumberFormats: []string{"", "", "", "DD/MM/YYYY", "DD/MM/YYYY", "", "", "", `#,##0`, `#,##0;(#,##0);"-"`, `#,##0;(#,##0);"-"`, `#,##0;(#,##0);"-"`, `#,##0;(#,##0);"-"`, `#,##0;(#,##0);"-"`, `#,##0;(#,##0);"-"`, ""},
 			Backgrounds:   backgrounds,
 			FontColors:    fontColors,
 		},
@@ -1568,7 +1586,7 @@ func handleAdminListActivations(w http.ResponseWriter, r *http.Request) {
 			  FROM activations`
 	args := []interface{}{}
 	if req.Email != "" {
-		query += ` AND email=$1`
+		query += ` WHERE email=$1`
 		args = append(args, req.Email)
 	}
 	query += ` ORDER BY activated_at DESC`
